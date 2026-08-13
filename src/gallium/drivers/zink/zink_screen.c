@@ -43,6 +43,7 @@
 #include "util/u_memory.h"
 #include "util/u_screen.h"
 #include "util/u_string.h"
+#include "util/libsync.h"
 #include "util/perf/u_trace.h"
 #include "util/u_transfer_helper.h"
 #include "util/hex.h"
@@ -2537,8 +2538,6 @@ zink_screen_import_dmabuf_semaphore(struct zink_screen *screen, struct zink_reso
 {
 #if defined(HAVE_LIBDRM) && (DETECT_OS_LINUX || DETECT_OS_BSD)
    static bool no_dma_buf_sync_file = false;
-   if (no_dma_buf_sync_file)
-      return sem;
 
    const VkSemaphoreGetFdInfoKHR get_fd_info = {
       .sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR,
@@ -2552,23 +2551,39 @@ zink_screen_import_dmabuf_semaphore(struct zink_screen *screen, struct zink_reso
    }
 
    bool ret = false;
-   int fd = zink_resource_get_dma_buf(screen, res);
-   if (fd != -1) {
-      struct dma_buf_import_sync_file import = {
-         .flags = DMA_BUF_SYNC_RW,
-         .fd = sync_file_fd,
-      };
-      int ioctl_ret = drmIoctl(fd, DMA_BUF_IOCTL_IMPORT_SYNC_FILE, &import);
-      if (ioctl_ret) {
-         if (errno == ENOTTY || errno == EBADF || errno == ENOSYS) {
-            no_dma_buf_sync_file = true;
+   bool imported = false;
+   if (!no_dma_buf_sync_file) {
+      int fd = zink_resource_get_dma_buf(screen, res);
+      if (fd != -1) {
+         struct dma_buf_import_sync_file import = {
+            .flags = DMA_BUF_SYNC_RW,
+            .fd = sync_file_fd,
+         };
+         int ioctl_ret = drmIoctl(fd, DMA_BUF_IOCTL_IMPORT_SYNC_FILE, &import);
+         if (ioctl_ret) {
+            if (errno == ENOTTY || errno == EBADF || errno == ENOSYS)
+               no_dma_buf_sync_file = true;
             ret = true;
          } else {
-            ret = true;
+            imported = true;
          }
+         close(fd);
+      } else {
+         ret = true;
       }
-      close(fd);
+   } else {
+      ret = true;
    }
+
+   /* Some Android dma-buf implementations do not support attaching the
+    * Vulkan release fence with DMA_BUF_IOCTL_IMPORT_SYNC_FILE.  Closing the
+    * sync fd in that case lets the consumer see the buffer before rendering
+    * completes.  A CPU wait is slower, but preserves presentation ordering.
+    */
+   if (!imported && sync_wait(sync_file_fd, -1))
+      mesa_loge("MESA: failed to wait for exported sync file '%s'",
+                strerror(errno));
+
    close(sync_file_fd);
    return ret;
 #else
