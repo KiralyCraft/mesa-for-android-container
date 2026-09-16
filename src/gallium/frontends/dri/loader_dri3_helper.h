@@ -69,6 +69,7 @@ struct loader_dri3_buffer {
    uint32_t     present_wait_fence; /* GPU completion fence for Present */
    int          present_wait_fence_triggered;
    struct util_queue_fence present_wait_job;
+   struct util_queue_fence mailbox_job;
    struct xshmfence *shm_fence; /* pointer to xshmfence object */
    bool         busy;           /* Set on swap, cleared on IdleNotify */
    bool         own_pixmap;     /* We allocated the pixmap ID, free on destroy */
@@ -100,6 +101,7 @@ loader_dri3_pixmap_buf_id(enum loader_dri3_buffer_type buffer_type)
 
 struct loader_dri3_drawable;
 struct loader_dri3_present_sync;
+struct loader_dri3_mailbox;
 
 struct loader_dri3_vtable {
    void (*set_drawable_size)(struct loader_dri3_drawable *, int, int);
@@ -174,11 +176,14 @@ struct loader_dri3_drawable {
    bool adaptive_sync;
    bool adaptive_sync_active;
    bool block_on_depleted_buffers;
+   bool mailbox_enabled;
+   bool is_xwayland;
    bool queries_buffer_age;
    bool present_sync_checked;
    int swap_interval;
 
    struct loader_dri3_present_sync *present_sync;
+   struct loader_dri3_mailbox *mailbox;
 
    const struct loader_dri3_vtable *vtable;
 

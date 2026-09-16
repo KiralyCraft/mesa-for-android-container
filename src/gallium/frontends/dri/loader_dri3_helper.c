@@ -33,6 +33,7 @@
 #include <xcb/xcb.h>
 #include <xcb/dri3.h>
 #include <xcb/present.h>
+#include <xcb/randr.h>
 #include <xcb/sync.h>
 
 #include <X11/Xlib-xcb.h>
@@ -71,6 +72,23 @@ struct loader_dri3_present_sync {
    int cancel_fd;
 };
 
+struct loader_dri3_mailbox {
+   struct util_queue queue;
+   int cancel_fd;
+   uint64_t last_sbc;
+};
+
+struct loader_dri3_mailbox_job {
+   xcb_connection_t *conn;
+   xcb_window_t window;
+   xcb_pixmap_t pixmap;
+   xcb_sync_fence_t idle_fence;
+   uint32_t serial;
+   uint32_t options;
+   int fence_fd;
+   int cancel_fd;
+};
+
 struct loader_dri3_present_job {
    xcb_connection_t *conn;
    xcb_sync_fence_t fence;
@@ -79,34 +97,46 @@ struct loader_dri3_present_job {
    int cancel_fd;
 };
 
+static bool
+dri3_wait_present_fence(int fence_fd, int cancel_fd, const char *description)
+{
+   struct pollfd fds[2] = {
+      { .fd = fence_fd, .events = POLLIN },
+      { .fd = cancel_fd, .events = POLLIN },
+   };
+   int nfds = fence_fd >= 0 ? ARRAY_SIZE(fds) : 1;
+   struct pollfd *poll_fds = fence_fd >= 0 ? fds : &fds[1];
+   int timeout = fence_fd >= 0 ? -1 : 0;
+   int ret;
+
+   do {
+      ret = poll(poll_fds, nfds, timeout);
+   } while (ret < 0 && errno == EINTR);
+
+   if (ret < 0)
+      mesa_loge("DRI3: failed to wait for %s fence: %s",
+                description, strerror(errno));
+
+   if (ret > 0 && fds[1].revents)
+      return false;
+
+   /* A sync_file normally signals with POLLIN.  Continue on an error so a
+    * broken fence cannot permanently deplete the drawable's back buffers.
+    */
+   if (fence_fd >= 0 && ret > 0 && !(fds[0].revents & POLLIN))
+      mesa_loge("DRI3: %s fence reported poll events 0x%x",
+                description, fds[0].revents);
+
+   return true;
+}
+
 static void
 dri3_present_job_execute(void *data, void *gdata, int thread_index)
 {
    struct loader_dri3_present_job *job = data;
-   struct pollfd fds[2] = {
-      { .fd = job->fence_fd, .events = POLLIN },
-      { .fd = job->cancel_fd, .events = POLLIN },
-   };
-   int ret;
-
-   do {
-      ret = poll(fds, ARRAY_SIZE(fds), -1);
-   } while (ret < 0 && errno == EINTR);
-
-   if (ret < 0) {
-      mesa_loge("DRI3: failed to wait for presentation fence: %s",
-                strerror(errno));
-   }
-
-   if (ret > 0 && fds[1].revents)
+   if (!dri3_wait_present_fence(job->fence_fd, job->cancel_fd,
+                                "presentation"))
       return;
-
-   /* A sync_file normally signals with POLLIN.  Trigger on an error too so a
-    * broken fence cannot leave the X server permanently blocked.
-    */
-   if (ret > 0 && !(fds[0].revents & POLLIN))
-      mesa_loge("DRI3: presentation fence reported poll events 0x%x",
-                fds[0].revents);
 
    /* Queue TriggerFence under XCB's connection lock before publishing the
     * state.  Any ResetFence submitted by the reuse thread after observing the
@@ -118,12 +148,150 @@ dri3_present_job_execute(void *data, void *gdata, int thread_index)
 }
 
 static void
+dri3_mailbox_job_execute(void *data, void *gdata, int thread_index)
+{
+   struct loader_dri3_mailbox_job *job = data;
+
+   if (!dri3_wait_present_fence(job->fence_fd, job->cancel_fd, "mailbox"))
+      return;
+
+   /* The producer is complete before the request reaches Xorg.  Native Xorg
+    * can therefore pick the newest request for the upcoming vblank without
+    * selecting an unsignaled frame and missing that refresh.
+    */
+   xcb_present_pixmap(job->conn,
+                      job->window,
+                      job->pixmap,
+                      job->serial,
+                      XCB_NONE,                         /* valid */
+                      XCB_NONE,                         /* update */
+                      0,                                /* x_off */
+                      0,                                /* y_off */
+                      XCB_NONE,                         /* target_crtc */
+                      XCB_NONE,                         /* wait_fence */
+                      job->idle_fence,
+                      job->options,
+                      0,                                /* target_msc */
+                      0,                                /* divisor */
+                      0, 0, NULL);                      /* remainder/notifies */
+   xcb_flush(job->conn);
+}
+
+static void
 dri3_present_job_cleanup(void *data, void *gdata, int thread_index)
 {
    struct loader_dri3_present_job *job = data;
 
-   close(job->fence_fd);
+   if (job->fence_fd >= 0)
+      close(job->fence_fd);
    free(job);
+}
+
+static void
+dri3_mailbox_job_cleanup(void *data, void *gdata, int thread_index)
+{
+   struct loader_dri3_mailbox_job *job = data;
+
+   if (job->fence_fd >= 0)
+      close(job->fence_fd);
+   free(job);
+}
+
+static void
+dri3_mailbox_fini(struct loader_dri3_drawable *draw)
+{
+   struct loader_dri3_mailbox *mailbox = draw->mailbox;
+
+   if (!mailbox)
+      return;
+
+   eventfd_write(mailbox->cancel_fd, 1);
+   util_queue_finish(&mailbox->queue);
+   util_queue_destroy(&mailbox->queue);
+   close(mailbox->cancel_fd);
+   free(mailbox);
+   draw->mailbox = NULL;
+}
+
+static bool
+dri3_mailbox_supported(const struct loader_dri3_drawable *draw)
+{
+   return draw->mailbox_enabled && !draw->is_xwayland &&
+          draw->type == LOADER_DRI3_DRAWABLE_WINDOW &&
+          draw->dri_screen_render_gpu == draw->dri_screen_display_gpu &&
+          draw->vtable->flush_drawable_with_fence_fd &&
+          (dri_fence_get_caps(draw->dri_screen_render_gpu) &
+           __DRI_FENCE_CAP_NATIVE_FD);
+}
+
+static bool
+dri3_mailbox_init(struct loader_dri3_drawable *draw)
+{
+   struct loader_dri3_mailbox *mailbox;
+
+   if (draw->mailbox)
+      return true;
+   if (!dri3_mailbox_supported(draw))
+      return false;
+
+   mailbox = calloc(1, sizeof(*mailbox));
+   if (!mailbox)
+      return false;
+
+   mailbox->cancel_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+   if (mailbox->cancel_fd < 0)
+      goto fail;
+
+   if (!util_queue_init(&mailbox->queue, "dri3-mailbox",
+                        LOADER_DRI3_MAX_BACK, 1, 0, NULL))
+      goto fail_cancel_fd;
+
+   draw->mailbox = mailbox;
+   return true;
+
+fail_cancel_fd:
+   close(mailbox->cancel_fd);
+fail:
+   free(mailbox);
+   return false;
+}
+
+static void
+dri3_mailbox_submit(struct loader_dri3_drawable *draw,
+                    struct loader_dri3_buffer *buffer,
+                    int fence_fd, uint64_t sbc, uint32_t options)
+{
+   struct loader_dri3_mailbox_job *job = calloc(1, sizeof(*job));
+   uint32_t serial = (uint32_t) sbc;
+
+   draw->mailbox->last_sbc = sbc;
+
+   if (!job) {
+      if (fence_fd >= 0) {
+         if (sync_wait(fence_fd, -1))
+            mesa_loge("DRI3: failed to wait for mailbox fence: %s",
+                      strerror(errno));
+         close(fence_fd);
+      }
+
+      xcb_present_pixmap(draw->conn, draw->drawable, buffer->pixmap, serial,
+                         XCB_NONE, XCB_NONE, 0, 0, XCB_NONE, XCB_NONE,
+                         buffer->sync_fence, options, 0, 0, 0, 0, NULL);
+      return;
+   }
+
+   job->conn = draw->conn;
+   job->window = draw->drawable;
+   job->pixmap = buffer->pixmap;
+   job->idle_fence = buffer->sync_fence;
+   job->serial = serial;
+   job->options = options;
+   job->fence_fd = fence_fd;
+   job->cancel_fd = draw->mailbox->cancel_fd;
+
+   util_queue_add_job(&draw->mailbox->queue, job, &buffer->mailbox_job,
+                      dri3_mailbox_job_execute, dri3_mailbox_job_cleanup,
+                      sizeof(*job));
 }
 
 static void
@@ -290,6 +458,68 @@ get_screen_for_root(xcb_connection_t *conn, xcb_window_t root)
    }
 
    return NULL;
+}
+
+static bool
+dri3_detect_xwayland(xcb_connection_t *conn, xcb_screen_t *screen)
+{
+   xcb_query_extension_cookie_t xwl_cookie =
+      xcb_query_extension(conn, strlen("XWAYLAND"), "XWAYLAND");
+   xcb_query_extension_cookie_t randr_cookie =
+      xcb_query_extension(conn, strlen("RANDR"), "RANDR");
+   xcb_query_extension_reply_t *xwl_reply =
+      xcb_query_extension_reply(conn, xwl_cookie, NULL);
+   xcb_query_extension_reply_t *randr_reply =
+      xcb_query_extension_reply(conn, randr_cookie, NULL);
+
+   if (xwl_reply && xwl_reply->present) {
+      free(xwl_reply);
+      free(randr_reply);
+      return true;
+   }
+   free(xwl_reply);
+
+   if (!screen || !randr_reply || !randr_reply->present) {
+      free(randr_reply);
+      return false;
+   }
+   free(randr_reply);
+
+   xcb_randr_query_version_reply_t *version =
+      xcb_randr_query_version_reply(
+         conn, xcb_randr_query_version_unchecked(conn, 1, 3), NULL);
+   bool has_randr_1_3 = version &&
+      (version->major_version > 1 || version->minor_version >= 3);
+   free(version);
+   if (!has_randr_1_3)
+      return false;
+
+   xcb_randr_get_screen_resources_current_reply_t *resources =
+      xcb_randr_get_screen_resources_current_reply(
+         conn,
+         xcb_randr_get_screen_resources_current_unchecked(conn, screen->root),
+         NULL);
+   if (!resources || resources->num_outputs == 0) {
+      free(resources);
+      return false;
+   }
+
+   xcb_randr_output_t output =
+      xcb_randr_get_screen_resources_current_outputs(resources)[0];
+   xcb_timestamp_t timestamp = resources->config_timestamp;
+   free(resources);
+
+   xcb_randr_get_output_info_reply_t *output_info =
+      xcb_randr_get_output_info_reply(
+         conn, xcb_randr_get_output_info(conn, output, timestamp), NULL);
+   if (!output_info)
+      return false;
+
+   const char *name = (const char *) xcb_randr_get_output_info_name(output_info);
+   bool is_xwayland = xcb_randr_get_output_info_name_length(output_info) >= 8 &&
+                      memcmp(name, "XWAYLAND", 8) == 0;
+   free(output_info);
+   return is_xwayland;
 }
 
 /* Error checking helpers for xcb_ functions. Use it to avoid late
@@ -487,6 +717,11 @@ dri3_fence_await(xcb_connection_t *c, struct loader_dri3_drawable *draw,
 static void
 dri3_update_max_num_back(struct loader_dri3_drawable *draw)
 {
+   if (dri3_mailbox_supported(draw) && draw->swap_interval == 0) {
+      draw->max_num_back = LOADER_DRI3_MAX_BACK;
+      return;
+   }
+
    switch (draw->last_present_mode) {
    case XCB_PRESENT_COMPLETE_MODE_FLIP: {
       if (draw->swap_interval == 0)
@@ -562,6 +797,9 @@ dri3_free_render_buffer(struct loader_dri3_drawable *draw,
    if (buffer->present_wait_fence && draw->present_sync)
       util_queue_fence_wait(&buffer->present_wait_job);
 
+   util_queue_fence_wait(&buffer->mailbox_job);
+   util_queue_fence_destroy(&buffer->mailbox_job);
+
    if (buffer->present_wait_fence) {
       util_queue_fence_destroy(&buffer->present_wait_job);
       xcb_sync_destroy_fence(draw->conn, buffer->present_wait_fence);
@@ -584,6 +822,7 @@ loader_dri3_drawable_fini(struct loader_dri3_drawable *draw)
 {
    int i;
 
+   dri3_mailbox_fini(draw);
    dri3_present_sync_fini(draw);
    driDestroyDrawable(draw->dri_drawable);
 
@@ -634,6 +873,7 @@ loader_dri3_drawable_init(xcb_connection_t *conn,
    draw->queries_buffer_age = false;
    draw->present_sync_checked = false;
    draw->present_sync = NULL;
+   draw->mailbox = NULL;
 
    draw->have_back = 0;
    draw->have_fake_front = 0;
@@ -641,6 +881,8 @@ loader_dri3_drawable_init(xcb_connection_t *conn,
    draw->adaptive_sync = false;
    draw->adaptive_sync_active = false;
    draw->block_on_depleted_buffers = false;
+   draw->mailbox_enabled = true;
+   draw->is_xwayland = false;
 
    draw->cur_blit_source = -1;
    draw->back_format = DRM_FORMAT_INVALID;
@@ -650,6 +892,7 @@ loader_dri3_drawable_init(xcb_connection_t *conn,
    {
       unsigned char adaptive_sync = 0;
       unsigned char block_on_depleted_buffers = 0;
+      unsigned char mailbox_enabled = 1;
 
       dri2GalliumConfigQueryb(draw->dri_screen_render_gpu,
                                       "adaptive_sync",
@@ -662,6 +905,11 @@ loader_dri3_drawable_init(xcb_connection_t *conn,
                                       &block_on_depleted_buffers);
 
       draw->block_on_depleted_buffers = block_on_depleted_buffers;
+
+      dri2GalliumConfigQueryb(draw->dri_screen_render_gpu,
+                              "dri3_mailbox", &mailbox_enabled);
+
+      draw->mailbox_enabled = mailbox_enabled;
    }
 
    if (!draw->adaptive_sync)
@@ -686,6 +934,7 @@ loader_dri3_drawable_init(xcb_connection_t *conn,
    }
 
    draw->screen = get_screen_for_root(draw->conn, reply->root);
+   draw->is_xwayland = dri3_detect_xwayland(draw->conn, draw->screen);
    draw->width = reply->width;
    draw->height = reply->height;
    draw->depth = reply->depth;
@@ -1249,6 +1498,7 @@ loader_dri3_swap_buffers_msc(struct loader_dri3_drawable *draw,
    struct loader_dri3_buffer *back;
    int64_t ret = 0;
    int render_fence_fd = -1;
+   bool mailbox_present = false;
    bool wait_for_next_buffer = false;
 
    /* GLX spec:
@@ -1279,8 +1529,22 @@ loader_dri3_swap_buffers_msc(struct loader_dri3_drawable *draw,
    if (!draw->have_back || draw->type == LOADER_DRI3_DRAWABLE_PIXMAP)
       return ret;
 
+   mailbox_present = draw->swap_interval == 0 && target_msc == 0 &&
+                     divisor == 0 && remainder == 0 && !force_copy &&
+                     dri3_mailbox_init(draw);
+
+   /* A direct or explicitly scheduled Present request must not overtake work
+    * which is still waiting in the mailbox worker.
+    */
+   if (!mailbox_present && draw->mailbox &&
+       draw->recv_sbc < draw->mailbox->last_sbc)
+      loader_dri3_swapbuffer_barrier(draw);
+
+   if (mailbox_present)
+      draw->max_num_back = LOADER_DRI3_MAX_BACK;
+
    if (draw->type == LOADER_DRI3_DRAWABLE_WINDOW &&
-       draw->present_sync &&
+       (mailbox_present || draw->present_sync) &&
        draw->vtable->flush_drawable_with_fence_fd) {
       render_fence_fd =
          draw->vtable->flush_drawable_with_fence_fd(draw, flush_flags);
@@ -1403,7 +1667,7 @@ loader_dri3_swap_buffers_msc(struct loader_dri3_drawable *draw,
        * the default.
        */
       uint32_t options = XCB_PRESENT_OPTION_NONE;
-      if (draw->swap_interval <= 0)
+      if (draw->swap_interval <= 0 && !mailbox_present)
          options |= XCB_PRESENT_OPTION_ASYNC;
 
       /* If we need to populate the new back, but need to reuse the back
@@ -1419,26 +1683,31 @@ loader_dri3_swap_buffers_msc(struct loader_dri3_drawable *draw,
       back->busy = 1;
       back->last_swap = draw->send_sbc;
 
-      xcb_sync_fence_t wait_fence =
-         dri3_queue_present_wait_fence(draw, back, render_fence_fd);
+      if (mailbox_present) {
+         dri3_mailbox_submit(draw, back, render_fence_fd,
+                             draw->send_sbc, options);
+         render_fence_fd = -1;
+      } else {
+         xcb_sync_fence_t wait_fence =
+            dri3_queue_present_wait_fence(draw, back, render_fence_fd);
+         xcb_xfixes_region_t region = 0;
 
-      xcb_xfixes_region_t region = 0;
-
-      xcb_present_pixmap(draw->conn,
-                         draw->drawable,
-                         back->pixmap,
-                         (uint32_t) draw->send_sbc,
-                         0,                                    /* valid */
-                         region,                               /* update */
-                         0,                                    /* x_off */
-                         0,                                    /* y_off */
-                         None,                                 /* target_crtc */
-                         wait_fence,
-                         back->sync_fence,
-                         options,
-                         target_msc,
-                         divisor,
-                         remainder, 0, NULL);
+         xcb_present_pixmap(draw->conn,
+                            draw->drawable,
+                            back->pixmap,
+                            (uint32_t) draw->send_sbc,
+                            0,                                 /* valid */
+                            region,                            /* update */
+                            0,                                 /* x_off */
+                            0,                                 /* y_off */
+                            None,                              /* target_crtc */
+                            wait_fence,
+                            back->sync_fence,
+                            options,
+                            target_msc,
+                            divisor,
+                            remainder, 0, NULL);
+      }
    } else {
       /* This can only be reached by double buffered GLXPbuffer. */
       assert(draw->type == LOADER_DRI3_DRAWABLE_PBUFFER);
@@ -1667,6 +1936,7 @@ dri3_alloc_render_buffer(struct loader_dri3_drawable *draw, unsigned int fourcc,
    buffer = calloc(1, sizeof *buffer);
    if (!buffer)
       goto no_buffer;
+   util_queue_fence_init(&buffer->mailbox_job);
 
    buffer->cpp = dri3_cpp_for_fourcc(fourcc);
    if (!buffer->cpp)
@@ -1851,7 +2121,7 @@ dri3_alloc_render_buffer(struct loader_dri3_drawable *draw, unsigned int fourcc,
 
    pixmap = xcb_generate_id(draw->conn);
 
-   xcb_void_cookie_t cookie_pix, cookie_fence;
+   xcb_void_cookie_t cookie_pix;
    if (draw->multiplanes_available &&
        buffer->modifier != DRM_FORMAT_MOD_INVALID) {
       cookie_pix = xcb_dri3_pixmap_from_buffers_checked(draw->conn,
@@ -1902,6 +2172,7 @@ no_linear_buffer:
    if (draw->dri_screen_render_gpu != draw->dri_screen_display_gpu)
       dri2_destroy_image(buffer->image);
 no_image:
+   util_queue_fence_destroy(&buffer->mailbox_job);
    free(buffer);
 no_buffer:
    return NULL;
@@ -2167,7 +2438,6 @@ dri3_get_pixmap_buffer(struct dri_drawable *driDrawable, unsigned int fourcc,
    int                                  buf_id = loader_dri3_pixmap_buf_id(buffer_type);
    struct loader_dri3_buffer            *buffer = draw->buffers[buf_id];
    xcb_drawable_t                       pixmap;
-   xcb_void_cookie_t                    cookie;
    int                                  width;
    int                                  height;
    struct dri_screen                          *cur_screen;
@@ -2180,6 +2450,7 @@ dri3_get_pixmap_buffer(struct dri_drawable *driDrawable, unsigned int fourcc,
    buffer = calloc(1, sizeof *buffer);
    if (!buffer)
       goto no_buffer;
+   util_queue_fence_init(&buffer->mailbox_job);
 
    /* Get the currently-bound screen or revert to using the drawable's screen if
     * no contexts are currently bound. The latter case is at least necessary for
@@ -2206,6 +2477,7 @@ dri3_get_pixmap_buffer(struct dri_drawable *driDrawable, unsigned int fourcc,
    return buffer;
 
 no_image:
+   util_queue_fence_destroy(&buffer->mailbox_job);
    free(buffer);
 no_buffer:
    return NULL;
