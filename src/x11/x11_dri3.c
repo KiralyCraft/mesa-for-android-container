@@ -49,9 +49,13 @@ x11_dri3_open(xcb_connection_t *conn,
    int                          fd;
    const xcb_query_extension_reply_t *extension;
 
-   const char *env = getenv("MESA_LOADER_DRIVER_OVERRIDE");
-   if (env && !strcmp(env, "kgsl"))
-      return open("/dev/kgsl-3d0", O_RDWR);
+   /* The leased Xorg must use the DRI3 render-node fd so renderonly can
+    * allocate KMS-compatible scanout buffers.  Opt-in bridge clients instead
+    * render into native KGSL buffers and explicitly copy completed frames to
+    * Xorg-owned pixmaps, so their render screen must be opened on KGSL. */
+   const char *bridge = getenv("MESA_KGSL_X11_SHM_BRIDGE");
+   if (bridge && !strcmp(bridge, "1"))
+      return open("/dev/kgsl-3d0", O_RDWR | O_CLOEXEC);
 
    xcb_prefetch_extension_data(conn, &xcb_dri3_id);
    extension = xcb_get_extension_data(conn, &xcb_dri3_id);
