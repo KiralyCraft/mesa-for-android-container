@@ -58,6 +58,24 @@ pacer_alloc_frame(struct loader_dri3_pacer *pacer)
 }
 
 static void
+pacer_expire_actual(struct loader_dri3_pacer *pacer, uint64_t now_us)
+{
+   for (unsigned i = 0; i < LOADER_DRI3_PACER_ACTUAL_SLOTS; i++) {
+      struct loader_dri3_pacer_actual_frame *frame =
+         &pacer->actual_frames[i];
+
+      if (!frame->pending || now_us < frame->submitted_us ||
+          now_us - frame->submitted_us <
+             LOADER_DRI3_PACER_ACTUAL_TIMEOUT_US)
+         continue;
+
+      frame->pending = false;
+      pacer->stats.actual_unknown++;
+      pacer->stats.actual_timeouts++;
+   }
+}
+
+static void
 pacer_add_sample(uint64_t *samples, uint32_t *head, uint32_t *count,
                  uint64_t sample)
 {
@@ -127,6 +145,8 @@ loader_dri3_pacer_reset_generation(struct loader_dri3_pacer *pacer,
    pacer->completion_count = 0;
    pacer->retention_head = 0;
    pacer->retention_count = 0;
+   pacer->actual_head = 0;
+   pacer->actual_count = 0;
    pacer->timing_valid = false;
    pacer->timing_timed_out = false;
    pacer->generation_needs_current_completion = true;
@@ -136,6 +156,8 @@ loader_dri3_pacer_reset_generation(struct loader_dri3_pacer *pacer,
           sizeof(pacer->submission_completion_us));
    memset(pacer->storage_retention_us, 0,
           sizeof(pacer->storage_retention_us));
+   memset(pacer->submission_actual_us, 0,
+          sizeof(pacer->submission_actual_us));
    pacer->stats.admitted++;
    pacer_observe(pacer, LOADER_DRI3_PACER_BLOCK_ADMISSION, now_us);
 }
@@ -376,6 +398,87 @@ loader_dri3_pacer_timing_timeout(struct loader_dri3_pacer *pacer,
    pacer_observe(pacer, LOADER_DRI3_PACER_BLOCK_STALE_TIMELINE, now_us);
 }
 
+void
+loader_dri3_pacer_expect_actual(struct loader_dri3_pacer *pacer,
+                                uint64_t serial, uint64_t submitted_us)
+{
+   struct loader_dri3_pacer_actual_frame *slot = NULL;
+   struct loader_dri3_pacer_actual_frame *oldest = NULL;
+
+   pacer_expire_actual(pacer, submitted_us);
+   for (unsigned i = 0; i < LOADER_DRI3_PACER_ACTUAL_SLOTS; i++) {
+      struct loader_dri3_pacer_actual_frame *frame =
+         &pacer->actual_frames[i];
+
+      if (frame->pending && (uint32_t) frame->serial == (uint32_t) serial) {
+         pacer->stats.actual_overflows++;
+         return;
+      }
+      if (!frame->pending && !slot)
+         slot = frame;
+      if (frame->pending &&
+          (!oldest || frame->submitted_us < oldest->submitted_us))
+         oldest = frame;
+   }
+
+   if (!slot) {
+      slot = oldest;
+      slot->pending = false;
+      pacer->stats.actual_unknown++;
+      pacer->stats.actual_overflows++;
+   }
+
+   *slot = (struct loader_dri3_pacer_actual_frame) {
+      .generation = pacer->generation,
+      .serial = serial,
+      .submitted_us = submitted_us,
+      .pending = true,
+   };
+   pacer->stats.actual_expected++;
+}
+
+void
+loader_dri3_pacer_note_actual(struct loader_dri3_pacer *pacer,
+                              uint32_t serial, bool presented,
+                              uint64_t actual_ust, uint64_t now_us)
+{
+   struct loader_dri3_pacer_actual_frame *match = NULL;
+
+   pacer_expire_actual(pacer, now_us);
+   for (unsigned i = 0; i < LOADER_DRI3_PACER_ACTUAL_SLOTS; i++) {
+      struct loader_dri3_pacer_actual_frame *frame =
+         &pacer->actual_frames[i];
+
+      if (frame->pending && (uint32_t) frame->serial == serial) {
+         match = frame;
+         break;
+      }
+   }
+
+   if (!match) {
+      pacer->stats.actual_unmatched++;
+      return;
+   }
+
+   match->pending = false;
+   if (!presented) {
+      pacer->stats.actual_unknown++;
+      return;
+   }
+
+   pacer->stats.actual_presented++;
+   if (!actual_ust || actual_ust < match->submitted_us ||
+       actual_ust > now_us + 1000000) {
+      pacer->stats.actual_invalid_timestamps++;
+      return;
+   }
+
+   if (match->generation == pacer->generation)
+      pacer_add_sample(pacer->submission_actual_us, &pacer->actual_head,
+                       &pacer->actual_count,
+                       actual_ust - match->submitted_us);
+}
+
 uint64_t
 loader_dri3_pacer_production_p95(const struct loader_dri3_pacer *pacer)
 {
@@ -450,10 +553,18 @@ loader_dri3_pacer_snapshot(const struct loader_dri3_pacer *pacer,
    snapshot->storage_retention_p95_us =
       pacer_percentile(pacer->storage_retention_us,
                        pacer->retention_count, 95);
+   snapshot->submission_actual_p95_us =
+      pacer_percentile(pacer->submission_actual_us,
+                       pacer->actual_count, 95);
    snapshot->outstanding_frames = pacer->outstanding_frames;
    snapshot->retained_allocations = pacer->retained_allocations;
    snapshot->timing_valid = pacer->timing_valid;
    snapshot->timing_timed_out = pacer->timing_timed_out;
+
+   for (unsigned i = 0; i < LOADER_DRI3_PACER_ACTUAL_SLOTS; i++) {
+      if (pacer->actual_frames[i].pending)
+         snapshot->actual_pending++;
+   }
 
    for (unsigned i = 0; i < pacer->observation_count; i++) {
       const struct loader_dri3_pacer_observation *observation =

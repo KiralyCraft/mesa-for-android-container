@@ -277,6 +277,37 @@ test_observation_window(void)
    assert(snapshot.stats.block_us[LOADER_DRI3_PACER_BLOCK_COMMITMENT] == 100);
 }
 
+static void
+test_actual_feedback_is_timing_only_and_bounded(void)
+{
+   struct loader_dri3_pacer pacer;
+   struct loader_dri3_pacer_snapshot snapshot;
+
+   loader_dri3_pacer_init(&pacer, 1000);
+   loader_dri3_pacer_expect_actual(&pacer, 1, 1000);
+   loader_dri3_pacer_note_actual(&pacer, 1, true, 5000, 6000);
+   loader_dri3_pacer_expect_actual(&pacer, 2, 7000);
+   loader_dri3_pacer_note_actual(&pacer, 2, false, 0, 8000);
+
+   assert(pacer.stats.actual_expected == 2);
+   assert(pacer.stats.actual_presented == 1);
+   assert(pacer.stats.actual_unknown == 1);
+   assert(pacer.outstanding_frames == 0);
+   assert(pacer.retained_allocations == 0);
+
+   loader_dri3_pacer_expect_actual(&pacer, 3, 9000);
+   loader_dri3_pacer_expect_actual(
+      &pacer, 4, 9000 + LOADER_DRI3_PACER_ACTUAL_TIMEOUT_US);
+   assert(pacer.stats.actual_timeouts == 1);
+   loader_dri3_pacer_note_actual(&pacer, 3, true, 10000,
+                                 10000 + LOADER_DRI3_PACER_ACTUAL_TIMEOUT_US);
+   assert(pacer.stats.actual_unmatched == 1);
+
+   loader_dri3_pacer_snapshot(&pacer, 2010000, &snapshot);
+   assert(snapshot.submission_actual_p95_us == 4000);
+   assert(snapshot.actual_pending == 1);
+}
+
 int
 main(void)
 {
@@ -290,6 +321,7 @@ main(void)
    test_old_generation_feedback_does_not_seed_timeline();
    test_retained_allocations_are_not_recycled();
    test_observation_window();
+   test_actual_feedback_is_timing_only_and_bounded();
    puts("loader_dri3_pacer_test: pass");
    return 0;
 }

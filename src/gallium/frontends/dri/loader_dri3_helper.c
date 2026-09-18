@@ -96,9 +96,14 @@ enum dri3_present_wait_status {
 #define DRI3_PRESENT_WAIT_FENCE_FAILED ((xcb_sync_fence_t) UINT32_MAX)
 
 /* Private Termux:X11 Present capability bits. */
+#define LORIE_PRESENT_CAP_ACTUAL_FEEDBACK         (1u << 28)
 #define LORIE_PRESENT_CAP_WAIT_FENCE_REQUEUE_SAFE (1u << 29)
 #define LORIE_PRESENT_CAP_VBLANK_COMPLETE         (1u << 30)
 #define LORIE_PRESENT_CAP_FRAME_TIMELINE          (1u << 31)
+#define LORIE_PRESENT_OPTION_ACTUAL_FEEDBACK      (1u << 31)
+#define LORIE_PRESENT_COMPLETE_KIND_ACTUAL        2
+#define LORIE_PRESENT_COMPLETE_MODE_ACTUAL        1
+#define LORIE_PRESENT_COMPLETE_MODE_UNKNOWN       2
 
 /* DEBUG: private reverse-allocation handshake with the matching Termux:X11
  * development server.  The pseudo modifier is deliberately not advertised
@@ -856,6 +861,23 @@ loader_dri3_drawable_fini(struct loader_dri3_drawable *draw)
                 snapshot.stats.block_us[LOADER_DRI3_PACER_BLOCK_ADMISSION],
                 snapshot.window_max_outstanding,
                 snapshot.window_max_retained);
+      mesa_logi("DRI3 pacing: actual_expected=%" PRIu64
+                " actual_presented=%" PRIu64
+                " actual_unknown=%" PRIu64
+                " actual_unmatched=%" PRIu64
+                " actual_timeouts=%" PRIu64
+                " actual_overflows=%" PRIu64
+                " actual_invalid_timestamps=%" PRIu64
+                " actual_pending=%u submission_actual_p95_us=%" PRIu64,
+                snapshot.stats.actual_expected,
+                snapshot.stats.actual_presented,
+                snapshot.stats.actual_unknown,
+                snapshot.stats.actual_unmatched,
+                snapshot.stats.actual_timeouts,
+                snapshot.stats.actual_overflows,
+                snapshot.stats.actual_invalid_timestamps,
+                snapshot.actual_pending,
+                snapshot.submission_actual_p95_us);
    }
 
    driDestroyDrawable(draw->dri_drawable);
@@ -1034,6 +1056,20 @@ dri3_handle_present_event(struct loader_dri3_drawable *draw,
    }
    case XCB_PRESENT_EVENT_COMPLETE_NOTIFY: {
       xcb_present_complete_notify_event_t *ce = (void *) ge;
+
+      if (ce->kind == LORIE_PRESENT_COMPLETE_KIND_ACTUAL) {
+         if ((draw->present_capabilities &
+              LORIE_PRESENT_CAP_ACTUAL_FEEDBACK) &&
+             ce->eid == draw->eid &&
+             (ce->mode == LORIE_PRESENT_COMPLETE_MODE_ACTUAL ||
+              ce->mode == LORIE_PRESENT_COMPLETE_MODE_UNKNOWN)) {
+            loader_dri3_pacer_note_actual(
+               &draw->pacer, ce->serial,
+               ce->mode == LORIE_PRESENT_COMPLETE_MODE_ACTUAL,
+               ce->ust, os_time_get());
+         }
+         break;
+      }
 
       /* Compute the processed SBC number from the received 32-bit serial number
        * merged with the upper 32-bits of the sent 64-bit serial number while
@@ -1938,6 +1974,10 @@ loader_dri3_swap_buffers_msc(struct loader_dri3_drawable *draw,
       uint32_t options = XCB_PRESENT_OPTION_NONE;
       if (draw->swap_interval <= 0 && !paced_present)
          options |= XCB_PRESENT_OPTION_ASYNC;
+      if (paced_present &&
+          (draw->present_capabilities &
+           LORIE_PRESENT_CAP_ACTUAL_FEEDBACK))
+         options |= LORIE_PRESENT_OPTION_ACTUAL_FEEDBACK;
 
       /* If we need to populate the new back, but need to reuse the back
        * buffer slot due to lack of local blit capabilities, make sure
@@ -1988,9 +2028,15 @@ loader_dri3_swap_buffers_msc(struct loader_dri3_drawable *draw,
                          remainder, 0, NULL);
 
       if (tracked_present) {
+         uint64_t submitted_us = os_time_get();
+
          dri3_record_present_wait_ready(draw, back);
          loader_dri3_pacer_note_submitted(&draw->pacer, submitted_serial,
-                                          os_time_get());
+                                          submitted_us);
+         if (options & LORIE_PRESENT_OPTION_ACTUAL_FEEDBACK)
+            loader_dri3_pacer_expect_actual(&draw->pacer,
+                                            submitted_serial,
+                                            submitted_us);
          if (paced_present && draw->admission_pacing)
             admission_deadline_us = loader_dri3_pacer_next_admission(
                &draw->pacer, target_msc, os_time_get());
