@@ -112,9 +112,16 @@ bool
 loader_dri3_pacer_submission_credit(const struct loader_dri3_pacer *pacer);
 
 bool
+loader_dri3_pacer_production_credit(const struct loader_dri3_pacer *pacer);
+
+bool
 loader_dri3_pacer_reserve(struct loader_dri3_pacer *pacer,
                           uint64_t serial, uint64_t target_msc,
                           uint64_t admitted_us, uint64_t now_us);
+
+void
+loader_dri3_pacer_set_target(struct loader_dri3_pacer *pacer,
+                             uint64_t serial, uint64_t target_msc);
 
 void
 loader_dri3_pacer_note_producer_ready(struct loader_dri3_pacer *pacer,

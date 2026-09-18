@@ -139,13 +139,29 @@ loader_dri3_pacer_submission_credit(const struct loader_dri3_pacer *pacer)
 }
 
 bool
+loader_dri3_pacer_production_credit(const struct loader_dri3_pacer *pacer)
+{
+   unsigned active = 0;
+
+   for (unsigned i = 0; i < LOADER_DRI3_PACER_FRAME_SLOTS; i++) {
+      const struct loader_dri3_pacer_frame *frame = &pacer->frames[i];
+
+      if (frame->reserved && !frame->completed && !frame->cancelled)
+         active++;
+   }
+
+   /* One frame may be producing while its predecessor remains committed. */
+   return active < 2;
+}
+
+bool
 loader_dri3_pacer_reserve(struct loader_dri3_pacer *pacer,
                           uint64_t serial, uint64_t target_msc,
                           uint64_t admitted_us, uint64_t now_us)
 {
    struct loader_dri3_pacer_frame *frame;
 
-   if (!loader_dri3_pacer_submission_credit(pacer) ||
+   if (!loader_dri3_pacer_production_credit(pacer) ||
        pacer_find_frame(pacer, serial))
       return false;
 
@@ -164,6 +180,16 @@ loader_dri3_pacer_reserve(struct loader_dri3_pacer *pacer,
    };
    pacer_observe(pacer, LOADER_DRI3_PACER_BLOCK_COMMITMENT, now_us);
    return true;
+}
+
+void
+loader_dri3_pacer_set_target(struct loader_dri3_pacer *pacer,
+                             uint64_t serial, uint64_t target_msc)
+{
+   struct loader_dri3_pacer_frame *frame = pacer_find_frame(pacer, serial);
+
+   if (frame && !frame->submitted)
+      frame->target_msc = target_msc;
 }
 
 void

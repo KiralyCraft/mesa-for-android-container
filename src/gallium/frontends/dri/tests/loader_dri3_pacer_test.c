@@ -50,6 +50,28 @@ test_independent_lifetimes(void)
 }
 
 static void
+test_production_and_submission_credits_are_independent(void)
+{
+   struct loader_dri3_pacer pacer;
+
+   loader_dri3_pacer_init(&pacer, 1000);
+   assert(loader_dri3_pacer_reserve(&pacer, 1, 11, 1000, 1000));
+   loader_dri3_pacer_note_submitted(&pacer, 1, 1100);
+   assert(!loader_dri3_pacer_submission_credit(&pacer));
+
+   assert(loader_dri3_pacer_production_credit(&pacer));
+   assert(loader_dri3_pacer_reserve(&pacer, 2, 0, 1100, 1100));
+   loader_dri3_pacer_set_target(&pacer, 2, 12);
+   assert(pacer.frames[1].target_msc == 12);
+   assert(!loader_dri3_pacer_production_credit(&pacer));
+   assert(!loader_dri3_pacer_reserve(&pacer, 3, 13, 1200, 1200));
+
+   loader_dri3_pacer_note_complete(&pacer, 1, 10000, 11, 1300);
+   assert(loader_dri3_pacer_submission_credit(&pacer));
+   loader_dri3_pacer_note_submitted(&pacer, 2, 1400);
+}
+
+static void
 test_production_history_and_deadline(void)
 {
    struct loader_dri3_pacer pacer;
@@ -190,6 +212,7 @@ int
 main(void)
 {
    test_independent_lifetimes();
+   test_production_and_submission_credits_are_independent();
    test_production_history_and_deadline();
    test_timeout_and_recovery();
    test_generation_reset_and_cancel();

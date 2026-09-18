@@ -75,7 +75,7 @@ struct loader_dri3_present_sync {
 };
 
 struct loader_dri3_present_job {
-   struct loader_dri3_drawable *draw;
+   struct loader_dri3_buffer *buffer;
    xcb_connection_t *conn;
    xcb_sync_fence_t fence;
    uint64_t serial;
@@ -140,15 +140,16 @@ dri3_present_job_execute(void *data, void *gdata, int thread_index)
    /* Queue TriggerFence under XCB's connection lock before publishing the
     * state.  Any ResetFence submitted by the reuse thread after observing the
     * state is therefore serialized after this trigger request.
-   */
+    */
    xcb_sync_trigger_fence(job->conn, job->fence);
-   p_atomic_set(job->fence_status, DRI3_PRESENT_WAIT_TRIGGERED);
    xcb_flush(job->conn);
 
-   mtx_lock(&job->draw->mtx);
-   loader_dri3_pacer_note_producer_ready(&job->draw->pacer, job->serial,
-                                         producer_ready_us);
-   mtx_unlock(&job->draw->mtx);
+   /* Publish the timestamp before the triggered status.  The drawable thread
+    * consumes this handoff while holding draw->mtx.  The worker must not take
+    * that mutex: buffer reuse can wait for this job while already holding it. */
+   job->buffer->present_wait_ready_serial = job->serial;
+   job->buffer->present_wait_ready_us = producer_ready_us;
+   p_atomic_set(job->fence_status, DRI3_PRESENT_WAIT_TRIGGERED);
 }
 
 static void
@@ -255,6 +256,34 @@ dri3_setup_present_wait_fence(struct loader_dri3_drawable *draw,
    }
 }
 
+static void
+dri3_record_present_wait_ready(struct loader_dri3_drawable *draw,
+                               struct loader_dri3_buffer *buffer)
+{
+   uint64_t serial, ready_us;
+
+   if (!buffer || !buffer->present_wait_fence ||
+       p_atomic_read(&buffer->present_wait_fence_status) !=
+          DRI3_PRESENT_WAIT_TRIGGERED)
+      return;
+
+   serial = buffer->present_wait_ready_serial;
+   ready_us = buffer->present_wait_ready_us;
+   if (!serial || !ready_us)
+      return;
+
+   buffer->present_wait_ready_serial = 0;
+   buffer->present_wait_ready_us = 0;
+   loader_dri3_pacer_note_producer_ready(&draw->pacer, serial, ready_us);
+}
+
+static void
+dri3_record_all_present_wait_ready(struct loader_dri3_drawable *draw)
+{
+   for (unsigned i = 0; i < ARRAY_SIZE(draw->buffers); i++)
+      dri3_record_present_wait_ready(draw, draw->buffers[i]);
+}
+
 static xcb_sync_fence_t
 dri3_queue_present_wait_fence(struct loader_dri3_drawable *draw,
                               struct loader_dri3_buffer *buffer,
@@ -272,8 +301,9 @@ dri3_queue_present_wait_fence(struct loader_dri3_drawable *draw,
     * signaled. Buffer idleness therefore does not imply that the previous
     * worker is done with this reusable X Sync fence. Finish that job before
     * resetting the fence or associating it with another submission.
-   */
+    */
    util_queue_fence_wait(&buffer->present_wait_job);
+   dri3_record_present_wait_ready(draw, buffer);
 
    if (p_atomic_read(&buffer->present_wait_fence_status) ==
        DRI3_PRESENT_WAIT_FAILED) {
@@ -298,7 +328,7 @@ dri3_queue_present_wait_fence(struct loader_dri3_drawable *draw,
    if (!job)
       goto sync_fallback;
 
-   job->draw = draw;
+   job->buffer = buffer;
    job->conn = draw->conn;
    job->fence = buffer->present_wait_fence;
    job->serial = serial;
@@ -682,8 +712,10 @@ dri3_free_render_buffer(struct loader_dri3_drawable *draw,
    if (!buffer)
       return;
 
-   if (buffer->present_wait_fence && draw->present_sync)
+   if (buffer->present_wait_fence && draw->present_sync) {
       util_queue_fence_wait(&buffer->present_wait_job);
+      dri3_record_present_wait_ready(draw, buffer);
+   }
 
    if (buffer->present_wait_fence &&
        p_atomic_read(&buffer->present_wait_fence_status) ==
@@ -722,6 +754,11 @@ loader_dri3_drawable_fini(struct loader_dri3_drawable *draw)
    struct loader_dri3_pacer_snapshot snapshot;
    int i;
 
+   /* Finish producer waits while buffers and the X connection are alive, then
+    * consume their timestamp handoffs before emitting the final snapshot. */
+   dri3_present_sync_fini(draw);
+   dri3_record_all_present_wait_ready(draw);
+
    if (draw->pacing_trace) {
       loader_dri3_pacer_snapshot(&draw->pacer, os_time_get(), &snapshot);
       mesa_logi("DRI3 pacing: admission_delay=%s admitted=%" PRIu64
@@ -752,7 +789,6 @@ loader_dri3_drawable_fini(struct loader_dri3_drawable *draw)
                 snapshot.window_max_retained);
    }
 
-   dri3_present_sync_fini(draw);
    driDestroyDrawable(draw->dri_drawable);
 
    for (i = 0; i < ARRAY_SIZE(draw->buffers); i++)
@@ -934,6 +970,8 @@ dri3_handle_present_event(struct loader_dri3_drawable *draw,
          bool timing_recovered = false;
          bool accepted_completion = false;
 
+         dri3_record_all_present_wait_ready(draw);
+
          /* Only assume wraparound if that results in exactly the previous
           * SBC + 1, otherwise ignore received SBC > sent SBC (those are
           * probably from a previous loader_dri3_drawable instance) to avoid
@@ -1003,6 +1041,7 @@ dri3_handle_present_event(struct loader_dri3_drawable *draw,
          struct loader_dri3_buffer *buf = draw->buffers[b];
 
          if (buf && buf->pixmap == ie->pixmap) {
+            dri3_record_present_wait_ready(draw, buf);
             buf->busy = 0;
             loader_dri3_pacer_note_storage_released(
                &draw->pacer, buf->last_swap, os_time_get());
@@ -1535,7 +1574,9 @@ loader_dri3_swap_buffers_msc(struct loader_dri3_drawable *draw,
    uint64_t producer_ready_observed_us = 0;
    uint64_t admission_deadline_us = 0;
    uint64_t submitted_serial = 0;
+   xcb_sync_fence_t wait_fence = XCB_NONE;
    bool paced_present = false;
+   bool tracked_present = false;
    bool wait_for_next_buffer = false;
 
    /* GLX spec:
@@ -1642,16 +1683,56 @@ loader_dri3_swap_buffers_msc(struct loader_dri3_drawable *draw,
 
    dri3_flush_present_events(draw);
 
+   /* Reserve this producing frame before waiting for the preceding backend
+    * commitment.  Production and submission are separate credits: one frame
+    * may already be complete while its predecessor is still committed.
+    *
+    * Queueing the existing PR96 wait-fence worker here also timestamps native
+    * fence readiness at the real wakeup, rather than after the commitment
+    * wait.  Triggering the X fence before PresentPixmap is legal; the later
+    * request still carries that dependency and no timing signal substitutes
+    * for producer completion. */
+   if (paced_present) {
+      submitted_serial = draw->send_sbc + 1;
+      if (frame_admitted_generation != draw->pacer.generation)
+         frame_admitted_us = 0;
+
+      if (!loader_dri3_pacer_reserve(&draw->pacer, submitted_serial, 0,
+                                     frame_admitted_us, os_time_get())) {
+         mesa_loge("DRI3: paced frame ledger lost production credit; "
+                   "temporarily falling back to synchronized unpaced "
+                   "presentation");
+         loader_dri3_pacer_timing_timeout(&draw->pacer, os_time_get());
+         paced_present = false;
+      } else {
+         tracked_present = true;
+         if (producer_ready_observed_us)
+            loader_dri3_pacer_note_producer_ready(
+               &draw->pacer, submitted_serial, producer_ready_observed_us);
+
+         wait_fence = dri3_queue_present_wait_fence(
+            draw, back, render_fence_fd, submitted_serial);
+         render_fence_fd = -1;
+         if (wait_fence == DRI3_PRESENT_WAIT_FENCE_FAILED) {
+            loader_dri3_pacer_cancel(&draw->pacer, submitted_serial,
+                                     os_time_get());
+            mtx_unlock(&draw->mtx);
+            dri_invalidate_drawable(draw->dri_drawable);
+            return ret;
+         }
+      }
+   }
+
    /* A paced drawable permits one frame to be produced while its predecessor
     * is committed to the presentation backend.  Do not turn the allocation
     * pool into an implicit Present queue: wait for that submission slot before
     * committing the frame which was just flushed.
     *
-    * The producer work and its native fence have already been submitted.  The
-    * wait below therefore cannot prevent the dependency from making progress,
-    * and the eventual Present request still carries the PR96 X wait-fence
-    * bridge.  A timing timeout only disables pacing; it never removes the
-    * producer dependency.
+    * The producer work and its native fence worker have already been
+    * submitted.  The wait below therefore cannot prevent the dependency from
+    * making progress, and the eventual Present request still carries the
+    * PR96 X wait-fence bridge.  A timing timeout only disables pacing; it
+    * never removes the producer dependency.
     */
    if (paced_present && draw->recv_sbc != draw->send_sbc) {
       uint64_t wait_start_us = os_time_get();
@@ -1733,25 +1814,12 @@ loader_dri3_swap_buffers_msc(struct loader_dri3_drawable *draw,
       }
 
       ++draw->send_sbc;
-      submitted_serial = draw->send_sbc;
-
-      if (frame_admitted_generation != draw->pacer.generation)
-         frame_admitted_us = 0;
-
-      if (paced_present &&
-          !loader_dri3_pacer_reserve(&draw->pacer, submitted_serial,
-                                     target_msc, frame_admitted_us,
-                                     os_time_get())) {
-         mesa_loge("DRI3: paced frame ledger lost submission credit; "
-                   "temporarily falling back to synchronized unpaced "
-                   "presentation");
-         loader_dri3_pacer_timing_timeout(&draw->pacer, os_time_get());
-         paced_present = false;
-      }
-
-      if (paced_present && producer_ready_observed_us)
-         loader_dri3_pacer_note_producer_ready(
-            &draw->pacer, submitted_serial, producer_ready_observed_us);
+      if (!submitted_serial)
+         submitted_serial = draw->send_sbc;
+      assert(submitted_serial == draw->send_sbc);
+      if (tracked_present)
+         loader_dri3_pacer_set_target(&draw->pacer, submitted_serial,
+                                      target_msc);
 
       /* From the GLX_EXT_swap_control spec
        * and the EGL 1.4 spec (page 53):
@@ -1785,12 +1853,14 @@ loader_dri3_swap_buffers_msc(struct loader_dri3_drawable *draw,
       if (draw->multiplanes_available)
          options |= XCB_PRESENT_OPTION_SUBOPTIMAL;
 
-      xcb_sync_fence_t wait_fence =
-         dri3_queue_present_wait_fence(draw, back, render_fence_fd,
-                                       submitted_serial);
+      if (!tracked_present) {
+         wait_fence = dri3_queue_present_wait_fence(
+            draw, back, render_fence_fd, submitted_serial);
+         render_fence_fd = -1;
+      }
 
       if (wait_fence == DRI3_PRESENT_WAIT_FENCE_FAILED) {
-         if (submitted_serial)
+         if (tracked_present)
             loader_dri3_pacer_cancel(&draw->pacer, submitted_serial,
                                      os_time_get());
          draw->send_sbc--;
@@ -1820,10 +1890,11 @@ loader_dri3_swap_buffers_msc(struct loader_dri3_drawable *draw,
                          divisor,
                          remainder, 0, NULL);
 
-      if (paced_present) {
+      if (tracked_present) {
+         dri3_record_present_wait_ready(draw, back);
          loader_dri3_pacer_note_submitted(&draw->pacer, submitted_serial,
                                           os_time_get());
-         if (draw->admission_pacing)
+         if (paced_present && draw->admission_pacing)
             admission_deadline_us = loader_dri3_pacer_next_admission(
                &draw->pacer, target_msc, os_time_get());
       }
@@ -1913,9 +1984,10 @@ loader_dri3_swap_buffers_msc(struct loader_dri3_drawable *draw,
     * control from the application has been met.  In particular, recording
     * admission before the writable-buffer wait would misclassify consumer
     * retention as game/GPU production time and bias the deadline estimator. */
-   if (paced_present) {
+   if (tracked_present) {
       uint64_t wait_start_us = os_time_get();
-      bool waited_for_admission = admission_deadline_us > wait_start_us;
+      bool waited_for_admission = paced_present &&
+                                  admission_deadline_us > wait_start_us;
 
       if (waited_for_admission)
          os_time_nanosleep_until(admission_deadline_us * 1000);
