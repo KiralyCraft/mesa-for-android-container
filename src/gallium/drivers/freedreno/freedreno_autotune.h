@@ -161,6 +161,7 @@ struct fd_batch_result {
    struct list_head node;
    uint32_t cost;
    uint32_t batch_hash;
+   uint64_t structural_signature;
    uint32_t num_draws;
    uint64_t samples_passed;
    uint64_t duration_ns;

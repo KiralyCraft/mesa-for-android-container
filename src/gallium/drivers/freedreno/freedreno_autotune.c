@@ -6,7 +6,10 @@
 #include "freedreno_autotune.h"
 #include "freedreno_batch.h"
 #include "freedreno_context.h"
+#include "freedreno_resource.h"
 #include "freedreno_util.h"
+
+#include "util/u_math.h"
 
 DEBUG_GET_ONCE_BOOL_OPTION(autotune_log, "FD_AUTOTUNE_LOG", false)
 
@@ -29,6 +32,166 @@ struct fd_batch_history {
    struct list_head results;
 #define MAX_RESULTS 5
 };
+
+/*
+ * An address-independent description of work whose GMEM and SYSMEM timings
+ * may be compared.  This is observation-only for now: the existing batch-key
+ * history and samples-passed policy remain authoritative.
+ *
+ * Keep this as an explicitly versioned, zero-initialized fixed layout so that
+ * compiler padding cannot make otherwise identical passes hash differently.
+ */
+#define FD_AUTOTUNE_SIGNATURE_VERSION 1
+
+struct fd_autotune_attachment_signature {
+   uint32_t pitch;
+   uint32_t layer_stride;
+   uint16_t view_format;
+   uint16_t resource_format;
+   uint16_t internal_format;
+   uint16_t first_layer;
+   uint16_t last_layer;
+   uint16_t level;
+   uint8_t target;
+   uint8_t samples;
+   uint8_t tile_mode;
+   uint8_t ubwc;
+   uint8_t cpp;
+   uint8_t pitchalign;
+   uint8_t plane;
+   uint8_t present;
+};
+
+struct fd_autotune_structural_signature {
+   uint32_t version;
+   uint32_t width;
+   uint32_t height;
+   uint32_t invalidated;
+   uint32_t cleared;
+   uint32_t restore;
+   uint32_t resolve;
+   uint32_t gmem_reason;
+   uint16_t layers;
+   uint8_t samples;
+   uint8_t nr_cbufs;
+   uint8_t draw_bucket;
+   uint8_t cost_bucket;
+   uint8_t subpass_bucket;
+   uint8_t flags;
+   uint8_t scissor_minx;
+   uint8_t scissor_miny;
+   uint8_t scissor_maxx;
+   uint8_t scissor_maxy;
+   uint8_t reserved[4];
+   struct fd_autotune_attachment_signature cbuf[PIPE_MAX_COLOR_BUFS];
+   struct fd_autotune_attachment_signature zsbuf;
+   struct fd_autotune_attachment_signature resolve_resource;
+};
+
+static uint8_t
+bucket_u32(uint32_t value)
+{
+   return util_logbase2_ceil(value);
+}
+
+static uint8_t
+quantize_coordinate(uint32_t coordinate, uint32_t extent)
+{
+   if (!extent)
+      return 0;
+
+   return MIN2((uint64_t)16, DIV_ROUND_UP((uint64_t)coordinate * 16, extent));
+}
+
+static void
+attachment_signature(struct fd_autotune_attachment_signature *signature,
+                     const struct pipe_surface *surface)
+{
+   if (!surface->texture)
+      return;
+
+   struct fd_resource *rsc = fd_resource(surface->texture);
+   const struct fdl_layout *layout = &rsc->layout;
+
+   signature->pitch = fdl_pitch(layout, surface->level);
+   signature->layer_stride = fdl_layer_stride(layout, surface->level);
+   signature->view_format = surface->format;
+   signature->resource_format = layout->format;
+   signature->internal_format = rsc->internal_format;
+   signature->first_layer = surface->first_layer;
+   signature->last_layer = surface->last_layer;
+   signature->level = surface->level;
+   signature->target = surface->texture->target;
+   signature->samples = fd_resource_nr_samples(surface->texture);
+   signature->tile_mode = fdl_tile_mode(layout, surface->level);
+   signature->ubwc = fdl_ubwc_enabled(layout, surface->level);
+   signature->cpp = layout->cpp;
+   signature->pitchalign = layout->pitchalign;
+   signature->plane = layout->plane;
+   signature->present = true;
+}
+
+static void
+resource_signature(struct fd_autotune_attachment_signature *signature,
+                   struct pipe_resource *resource)
+{
+   if (!resource)
+      return;
+
+   struct pipe_surface surface = {
+      .format = resource->format,
+      .first_layer = 0,
+      .last_layer = resource->array_size ? resource->array_size - 1 : 0,
+      .level = 0,
+      .texture = resource,
+   };
+
+   attachment_signature(signature, &surface);
+}
+
+static uint64_t
+structural_signature(struct fd_batch *batch)
+{
+   const struct pipe_framebuffer_state *pfb = &batch->framebuffer;
+   const struct pipe_scissor_state *scissor = &batch->max_scissor;
+   struct fd_autotune_structural_signature signature;
+
+   memset(&signature, 0, sizeof(signature));
+   signature.version = FD_AUTOTUNE_SIGNATURE_VERSION;
+   signature.width = pfb->width;
+   signature.height = pfb->height;
+   signature.invalidated = batch->invalidated;
+   signature.cleared = batch->cleared;
+   signature.restore = batch->restore;
+   signature.resolve = batch->resolve;
+   signature.gmem_reason = batch->gmem_reason;
+   signature.layers = pfb->layers;
+   signature.samples = pfb->samples;
+   signature.nr_cbufs = pfb->nr_cbufs;
+   signature.draw_bucket = bucket_u32(batch->num_draws);
+   signature.cost_bucket = bucket_u32(batch->cost);
+   signature.flags = (pfb->pls_enabled ? BITFIELD_BIT(0) : 0) |
+                     (batch->tessellation ? BITFIELD_BIT(1) : 0);
+   signature.scissor_minx = quantize_coordinate(scissor->minx, pfb->width);
+   signature.scissor_miny = quantize_coordinate(scissor->miny, pfb->height);
+   signature.scissor_maxx = quantize_coordinate(scissor->maxx + 1, pfb->width);
+   signature.scissor_maxy = quantize_coordinate(scissor->maxy + 1, pfb->height);
+
+   unsigned subpasses = 0;
+   foreach_subpass(subpass, batch) subpasses++;
+   signature.subpass_bucket = bucket_u32(subpasses);
+
+   for (unsigned i = 0; i < pfb->nr_cbufs; i++)
+      attachment_signature(&signature.cbuf[i], &pfb->cbufs[i]);
+   attachment_signature(&signature.zsbuf, &pfb->zsbuf);
+   resource_signature(&signature.resolve_resource, pfb->resolve);
+
+   uint32_t low = _mesa_hash_data(&signature, sizeof(signature));
+   uint32_t high =
+      _mesa_hash_data_with_seed(&signature, sizeof(signature), 0x9e3779b9);
+
+   return ((uint64_t)high << 32) | low;
+}
 
 static struct fd_batch_history *
 get_history(struct fd_autotune *at, struct fd_batch *batch)
@@ -164,10 +327,11 @@ process_results(struct fd_autotune *at)
       }
 
       if (unlikely(at->log)) {
-         mesa_logi("freedreno autotune: key=%08x draws=%u mode=%s "
+         mesa_logi("freedreno autotune: key=%08x signature=%016" PRIx64
+                   " draws=%u mode=%s "
                    "samples=%" PRIu64 " duration_ns=%" PRIu64,
-                   result->batch_hash, result->num_draws,
-                   result->use_bypass ? "sysmem" : "gmem",
+                   result->batch_hash, result->structural_signature,
+                   result->num_draws, result->use_bypass ? "sysmem" : "gmem",
                    result->samples_passed, result->duration_ns);
       }
 
@@ -243,6 +407,7 @@ fd_autotune_use_bypass(struct fd_autotune *at, struct fd_batch *batch)
 
    batch->autotune_result->cost = batch->cost;
    batch->autotune_result->batch_hash = batch->hash;
+   batch->autotune_result->structural_signature = structural_signature(batch);
    batch->autotune_result->num_draws = batch->num_draws;
 
    bool use_bypass = fallback_use_bypass(batch);
