@@ -885,6 +885,7 @@ dri3_handle_present_event(struct loader_dri3_drawable *draw,
        */
       if (ce->kind == XCB_PRESENT_COMPLETE_KIND_PIXMAP) {
          uint64_t recv_sbc = (draw->send_sbc & 0xffffffff00000000LL) | ce->serial;
+         bool timing_recovered = false;
 
          /* Only assume wraparound if that results in exactly the previous
           * SBC + 1, otherwise ignore received SBC > sent SBC (those are
@@ -928,12 +929,25 @@ dri3_handle_present_event(struct loader_dri3_drawable *draw,
              ce->ust > draw->pacing_last_complete_ust) {
             uint64_t sample = ce->ust - draw->pacing_last_complete_ust;
 
-            if (sample >= 4000 && sample <= 100000)
+            if (sample >= 4000 && sample <= 100000) {
                draw->pacing_period_us =
                   (draw->pacing_period_us * 7 + sample) / 8;
+               timing_recovered = draw->pacing_timed_out;
+            }
          }
          draw->pacing_last_complete_ust = ce->ust;
          draw->pacing_complete_count++;
+
+         /* A bounded wait deliberately falls back when Present feedback goes
+          * stale.  That fallback must not permanently disable pacing after a
+          * transient server or Android scheduling delay: a later monotonic,
+          * plausible completion sample proves that the timeline is advancing
+          * again.  Producer fences and buffer ownership remain independent of
+          * this timing-only recovery. */
+         if (timing_recovered) {
+            draw->pacing_timed_out = false;
+            mesa_logi("DRI3: paced Present feedback resumed");
+         }
       } else if (ce->serial == draw->eid) {
          draw->notify_ust = ce->ust;
          draw->notify_msc = ce->msc;
@@ -1754,7 +1768,8 @@ loader_dri3_swap_buffers_msc(struct loader_dri3_drawable *draw,
             draw->pacing_timeout_count++;
             draw->pacing_timed_out = true;
             mesa_loge("DRI3: paced Present feedback stale for %d ms; "
-                      "falling back to synchronized unpaced presentation",
+                      "temporarily falling back to synchronized unpaced "
+                      "presentation",
                       timeout_ms);
             break;
          }
