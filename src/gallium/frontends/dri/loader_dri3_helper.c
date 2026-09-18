@@ -30,6 +30,7 @@
 #include <string.h>
 #include <sys/eventfd.h>
 #include <sys/ioctl.h>
+#include <sys/socket.h>
 
 #include <xcb/xcb.h>
 #include <xcb/dri3.h>
@@ -98,6 +99,31 @@ enum dri3_present_wait_status {
 #define LORIE_PRESENT_CAP_WAIT_FENCE_REQUEUE_SAFE (1u << 29)
 #define LORIE_PRESENT_CAP_VBLANK_COMPLETE         (1u << 30)
 #define LORIE_PRESENT_CAP_FRAME_TIMELINE          (1u << 31)
+
+/* DEBUG: private reverse-allocation handshake with the matching Termux:X11
+ * development server.  The pseudo modifier is deliberately not advertised
+ * as a DRM layout modifier and is used only when explicitly requested. */
+#define LORIE_DRI3_AHB_ALLOCATE_SOCKET_FD UINT64_C(1257)
+#define LORIE_DRI3_AHB_ALLOCATION_MAGIC 0x4248414cU
+#define LORIE_DRI3_AHB_ALLOCATION_VERSION 1U
+#define LORIE_DRI3_AHB_MAX_HANDLE_FDS 16
+#define LORIE_DRI3_AHB_REPLY_TIMEOUT_MS 1000
+/* Stable NDK AHardwareBuffer usage values used by private protocol v1. */
+#define LORIE_DRI3_AHB_REQUIRED_USAGE UINT64_C(0xb33)
+
+struct __attribute__((packed)) lorie_dri3_ahb_allocation_reply {
+   uint32_t magic;
+   uint32_t version;
+   int32_t status;
+   uint32_t width;
+   uint32_t height;
+   uint32_t stride;
+   uint32_t format;
+   uint64_t usage;
+};
+
+static_assert(sizeof(struct lorie_dri3_ahb_allocation_reply) == 36,
+              "Termux:X11 consumer-allocation reply layout changed");
 
 /* Xlib may read the shared XCB socket on another thread and enqueue a Present
  * special event after our queue check.  The socket is no longer readable in
@@ -885,6 +911,7 @@ loader_dri3_drawable_init(xcb_connection_t *conn,
    draw->present_capabilities = 0;
    draw->admission_pacing = true;
    draw->pacing_trace = false;
+   draw->experimental_consumer_owned_alloc = false;
    loader_dri3_pacer_init(&draw->pacer, os_time_get());
 
    draw->have_back = 0;
@@ -929,6 +956,10 @@ loader_dri3_drawable_init(xcb_connection_t *conn,
          debug_get_bool_option("MESA_DRI3_ADMISSION_PACING", true);
       draw->pacing_trace =
          debug_get_bool_option("MESA_DRI3_PRESENT_TRACE", false);
+      /* DEBUG: paired with TERMUX_X11_EXPERIMENTAL_DIRECT_ALLOC on the
+       * development server.  Never infer this from ordinary DRI3 support. */
+      draw->experimental_consumer_owned_alloc = debug_get_bool_option(
+         "MESA_DRI3_EXPERIMENTAL_CONSUMER_ALLOC", false);
    }
 
    if (!draw->adaptive_sync)
@@ -2196,6 +2227,199 @@ has_supported_modifier(struct loader_dri3_drawable *draw, unsigned int format,
  *
  * Allocate an xshmfence for synchronization
  */
+static bool
+dri3_read_exact_with_timeout(int fd, void *data, size_t size)
+{
+   uint8_t *cursor = data;
+
+   while (size) {
+      struct pollfd pfd = { .fd = fd, .events = POLLIN };
+      int ret;
+
+      do {
+         ret = poll(&pfd, 1, LORIE_DRI3_AHB_REPLY_TIMEOUT_MS);
+      } while (ret < 0 && errno == EINTR);
+      if (ret <= 0 || !(pfd.revents & (POLLIN | POLLHUP)))
+         return false;
+
+      ssize_t received = recv(fd, cursor, size, 0);
+      if (received < 0 && errno == EINTR)
+         continue;
+      if (received <= 0)
+         return false;
+      cursor += received;
+      size -= received;
+   }
+   return true;
+}
+
+/* DEBUG: Consume Android's opaque AHardwareBuffer socket payload and retain
+ * only its first descriptor.  Qualcomm native handles put the primary image
+ * allocation first; all metadata descriptors remain closed.  This is an
+ * experimental linear-import gate, not a general AHardwareBuffer parser. */
+static int
+dri3_recv_ahb_primary_fd(int fd, unsigned *received_fd_count)
+{
+   int primary_fd = -1;
+   unsigned count = 0;
+
+   for (;;) {
+      struct pollfd pfd = { .fd = fd, .events = POLLIN };
+      union {
+         struct cmsghdr align;
+         uint8_t bytes[CMSG_SPACE(LORIE_DRI3_AHB_MAX_HANDLE_FDS * sizeof(int))];
+      } control = {0};
+      uint8_t payload[512];
+      struct iovec iov = { .iov_base = payload, .iov_len = sizeof(payload) };
+      struct msghdr msg = {
+         .msg_iov = &iov,
+         .msg_iovlen = 1,
+         .msg_control = control.bytes,
+         .msg_controllen = sizeof(control.bytes),
+      };
+      int ret;
+
+      do {
+         ret = poll(&pfd, 1, LORIE_DRI3_AHB_REPLY_TIMEOUT_MS);
+      } while (ret < 0 && errno == EINTR);
+      if (ret <= 0 || !(pfd.revents & (POLLIN | POLLHUP)))
+         goto fail;
+
+      ssize_t received;
+      do {
+         received = recvmsg(fd, &msg, 0);
+      } while (received < 0 && errno == EINTR);
+      if (received == 0)
+         break;
+      if (received < 0 || (msg.msg_flags & MSG_CTRUNC))
+         goto fail;
+
+      for (struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg); cmsg;
+           cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+         if (cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS ||
+             cmsg->cmsg_len < CMSG_LEN(sizeof(int)))
+            continue;
+
+         unsigned num_fds =
+            (cmsg->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+         int *fds = (int *) CMSG_DATA(cmsg);
+         for (unsigned i = 0; i < num_fds; i++) {
+            fcntl(fds[i], F_SETFD, FD_CLOEXEC);
+            if (primary_fd < 0)
+               primary_fd = fds[i];
+            else
+               close(fds[i]);
+            count++;
+         }
+      }
+   }
+
+   if (received_fd_count)
+      *received_fd_count = count;
+   return primary_fd;
+
+fail:
+   if (primary_fd >= 0)
+      close(primary_fd);
+   return -1;
+}
+
+static bool
+dri3_try_alloc_consumer_owned(struct loader_dri3_drawable *draw,
+                              struct loader_dri3_buffer *buffer,
+                              unsigned fourcc, int width, int height,
+                              int depth)
+{
+   struct lorie_dri3_ahb_allocation_reply reply;
+   int sockets[2] = {-1, -1};
+   xcb_pixmap_t pixmap = XCB_NONE;
+   int dmabuf_fd = -1;
+   unsigned handle_fd_count = 0;
+   unsigned image_error = 0;
+   int stride, offset = 0;
+   bool success = false;
+
+   if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) != 0)
+      return false;
+
+   pixmap = xcb_generate_id(draw->conn);
+   int server_socket = sockets[1];
+   xcb_void_cookie_t cookie =
+      xcb_dri3_pixmap_from_buffers_checked(draw->conn, pixmap, draw->window,
+                                           1, width, height,
+                                           width * buffer->cpp, 0,
+                                           0, 0, 0, 0, 0, 0,
+                                           depth, buffer->cpp * 8,
+                                           LORIE_DRI3_AHB_ALLOCATE_SOCKET_FD,
+                                           &server_socket);
+   sockets[1] = -1; /* XCB owns the descriptor after queuing the request. */
+
+   if (!check_xcb_error(cookie, "experimental consumer-owned allocation"))
+      goto out;
+   if (!dri3_read_exact_with_timeout(sockets[0], &reply, sizeof(reply))) {
+      mesa_loge("DRI3: consumer-owned allocation returned no description");
+      goto out;
+   }
+   if (reply.magic != LORIE_DRI3_AHB_ALLOCATION_MAGIC ||
+       reply.version != LORIE_DRI3_AHB_ALLOCATION_VERSION ||
+       reply.status != 0 || reply.width != (uint32_t) width ||
+       reply.height != (uint32_t) height || reply.stride < reply.width ||
+       reply.format != 5 ||
+       (reply.usage & LORIE_DRI3_AHB_REQUIRED_USAGE) !=
+          LORIE_DRI3_AHB_REQUIRED_USAGE) {
+      mesa_loge("DRI3: rejected consumer-owned allocation reply "
+                "magic=%08x version=%u status=%d size=%ux%u stride=%u "
+                "format=%u", reply.magic, reply.version, reply.status,
+                reply.width, reply.height, reply.stride, reply.format);
+      goto out;
+   }
+
+   dmabuf_fd = dri3_recv_ahb_primary_fd(sockets[0], &handle_fd_count);
+   if (dmabuf_fd < 0) {
+      mesa_loge("DRI3: consumer-owned allocation supplied no dma-buf");
+      goto out;
+   }
+
+   stride = (int) reply.stride * (int) buffer->cpp;
+   buffer->image = dri2_from_dma_bufs(draw->dri_screen_render_gpu,
+                                      width, height, fourcc,
+                                      DRM_FORMAT_MOD_LINEAR,
+                                      &dmabuf_fd, 1, &stride, &offset,
+                                      0, 0, 0, 0, 0, &image_error, buffer);
+   if (!buffer->image) {
+      mesa_loge("DRI3: KGSL rejected consumer-owned dma-buf (image error %u)",
+                image_error);
+      goto out;
+   }
+
+   dri3_present_sync_init(draw, dmabuf_fd);
+   buffer->pixmap = pixmap;
+   buffer->own_pixmap = true;
+   buffer->num_planes = 1;
+   buffer->strides[0] = stride;
+   buffer->offsets[0] = 0;
+   buffer->modifier = DRM_FORMAT_MOD_LINEAR;
+   buffer->width = width;
+   buffer->height = height;
+   dri3_setup_present_wait_fence(draw, buffer);
+   dri3_fence_set(buffer);
+   mesa_logi("DEBUG: DRI3 imported consumer-owned AHardwareBuffer "
+             "%dx%d stride=%d handle_fds=%u usage=0x%" PRIx64,
+             width, height, stride, handle_fd_count, reply.usage);
+   success = true;
+
+out:
+   if (dmabuf_fd >= 0)
+      close(dmabuf_fd);
+   if (sockets[0] >= 0)
+      close(sockets[0]);
+   if (sockets[1] >= 0)
+      close(sockets[1]);
+   if (!success && pixmap != XCB_NONE)
+      xcb_free_pixmap(draw->conn, pixmap);
+   return success;
+}
+
 static struct loader_dri3_buffer *
 dri3_alloc_render_buffer(struct loader_dri3_drawable *draw, unsigned int fourcc,
                          int width, int height, int depth)
@@ -2220,6 +2444,18 @@ dri3_alloc_render_buffer(struct loader_dri3_drawable *draw, unsigned int fourcc,
    buffer->cpp = dri3_cpp_for_fourcc(fourcc);
    if (!buffer->cpp)
       goto no_image;
+
+   /* DEBUG: The production path remains driver-owned.  This reverse
+    * allocation experiment is restricted to single-GPU, single-plane XRGB
+    * windows and falls back immediately on any protocol/import failure. */
+   if (draw->experimental_consumer_owned_alloc &&
+       draw->type == LOADER_DRI3_DRAWABLE_WINDOW &&
+       draw->dri_screen_render_gpu == draw->dri_screen_display_gpu &&
+       draw->multiplanes_available && !draw->is_protected_content &&
+       (fourcc == DRM_FORMAT_XRGB8888 || fourcc == DRM_FORMAT_ARGB8888) &&
+       dri3_try_alloc_consumer_owned(draw, buffer, fourcc, width, height,
+                                     depth))
+      return buffer;
 
    if (draw->dri_screen_render_gpu == draw->dri_screen_display_gpu) {
       if (draw->multiplanes_available && draw->dri_screen_render_gpu->base.screen->resource_create_with_modifiers) {

@@ -187,6 +187,9 @@ struct loader_dri3_drawable {
    bool present_sync_checked;
    bool admission_pacing;
    bool pacing_trace;
+   /* DEBUG: opt-in reverse DRI3 allocation handshake with the matching
+    * Termux:X11 development server.  Never enabled by default. */
+   bool experimental_consumer_owned_alloc;
    int swap_interval;
    enum loader_dri3_present_mode present_mode;
    uint32_t present_capabilities;
