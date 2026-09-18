@@ -813,6 +813,8 @@ loader_dri3_drawable_fini(struct loader_dri3_drawable *draw)
       mesa_logi("DRI3 pacing: period_us=%" PRIu64
                 " production_p95_us=%" PRIu64
                 " ready_residence_p95_us=%" PRIu64
+                " submission_completion_p95_us=%" PRIu64
+                " storage_retention_p95_us=%" PRIu64
                 " commitment_waits=%" PRIu64
                 " commitment_wait_us=%" PRIu64
                 " admission_waits=%" PRIu64
@@ -820,6 +822,8 @@ loader_dri3_drawable_fini(struct loader_dri3_drawable *draw)
                 " window_outstanding=%u window_retained=%u",
                 snapshot.period_us, snapshot.production_p95_us,
                 snapshot.ready_residence_p95_us,
+                snapshot.submission_completion_p95_us,
+                snapshot.storage_retention_p95_us,
                 snapshot.stats.block_count[LOADER_DRI3_PACER_BLOCK_COMMITMENT],
                 snapshot.stats.block_us[LOADER_DRI3_PACER_BLOCK_COMMITMENT],
                 snapshot.stats.block_count[LOADER_DRI3_PACER_BLOCK_ADMISSION],

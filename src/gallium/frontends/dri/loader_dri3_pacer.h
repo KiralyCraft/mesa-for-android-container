@@ -67,6 +67,8 @@ struct loader_dri3_pacer_snapshot {
    uint64_t period_us;
    uint64_t production_p95_us;
    uint64_t ready_residence_p95_us;
+   uint64_t submission_completion_p95_us;
+   uint64_t storage_retention_p95_us;
    uint32_t outstanding_frames;
    uint32_t retained_allocations;
    uint32_t window_max_outstanding;
@@ -81,6 +83,8 @@ struct loader_dri3_pacer {
       observations[LOADER_DRI3_PACER_HISTORY_SIZE];
    uint64_t production_us[LOADER_DRI3_PACER_HISTORY_SIZE];
    uint64_t ready_residence_us[LOADER_DRI3_PACER_HISTORY_SIZE];
+   uint64_t submission_completion_us[LOADER_DRI3_PACER_HISTORY_SIZE];
+   uint64_t storage_retention_us[LOADER_DRI3_PACER_HISTORY_SIZE];
    struct loader_dri3_pacer_stats stats;
    uint64_t generation;
    uint64_t current_admission_us;
@@ -93,6 +97,10 @@ struct loader_dri3_pacer {
    uint32_t production_count;
    uint32_t residence_head;
    uint32_t residence_count;
+   uint32_t completion_head;
+   uint32_t completion_count;
+   uint32_t retention_head;
+   uint32_t retention_count;
    uint32_t observation_head;
    uint32_t observation_count;
    uint32_t outstanding_frames;

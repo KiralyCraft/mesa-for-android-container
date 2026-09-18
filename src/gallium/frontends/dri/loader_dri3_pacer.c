@@ -123,11 +123,19 @@ loader_dri3_pacer_reset_generation(struct loader_dri3_pacer *pacer,
    pacer->production_count = 0;
    pacer->residence_head = 0;
    pacer->residence_count = 0;
+   pacer->completion_head = 0;
+   pacer->completion_count = 0;
+   pacer->retention_head = 0;
+   pacer->retention_count = 0;
    pacer->timing_valid = false;
    pacer->timing_timed_out = false;
    pacer->generation_needs_current_completion = true;
    memset(pacer->production_us, 0, sizeof(pacer->production_us));
    memset(pacer->ready_residence_us, 0, sizeof(pacer->ready_residence_us));
+   memset(pacer->submission_completion_us, 0,
+          sizeof(pacer->submission_completion_us));
+   memset(pacer->storage_retention_us, 0,
+          sizeof(pacer->storage_retention_us));
    pacer->stats.admitted++;
    pacer_observe(pacer, LOADER_DRI3_PACER_BLOCK_ADMISSION, now_us);
 }
@@ -209,7 +217,8 @@ loader_dri3_pacer_note_producer_ready(struct loader_dri3_pacer *pacer,
       frame->storage_released_us = now_us;
       pacer->stats.storage_released++;
    }
-   if (frame->admitted_us && now_us >= frame->admitted_us &&
+   if (frame->generation == pacer->generation && frame->admitted_us &&
+       now_us >= frame->admitted_us &&
        now_us - frame->admitted_us <=
           (pacer->period_us * 4 > 100000 ? pacer->period_us * 4 : 100000))
       pacer_add_sample(pacer->production_us, &pacer->production_head,
@@ -219,7 +228,8 @@ loader_dri3_pacer_note_producer_ready(struct loader_dri3_pacer *pacer,
    /* Completed-candidate residence ends at backend submission.  When the
     * dependency becomes ready only after submission, the frame never resided
     * in the completed-but-uncommitted state and contributes a zero sample. */
-   if (frame->submitted && !frame->residence_sampled) {
+   if (frame->generation == pacer->generation && frame->submitted &&
+       !frame->residence_sampled) {
       pacer_add_sample(pacer->ready_residence_us, &pacer->residence_head,
                        &pacer->residence_count,
                        frame->submitted_us >= now_us ?
@@ -242,7 +252,8 @@ loader_dri3_pacer_note_submitted(struct loader_dri3_pacer *pacer,
    pacer->outstanding_frames++;
    pacer->retained_allocations++;
    pacer->stats.submitted++;
-   if (frame->producer_ready && !frame->residence_sampled) {
+   if (frame->generation == pacer->generation && frame->producer_ready &&
+       !frame->residence_sampled) {
       pacer_add_sample(pacer->ready_residence_us, &pacer->residence_head,
                        &pacer->residence_count,
                        now_us >= frame->producer_ready_us ?
@@ -286,6 +297,11 @@ loader_dri3_pacer_note_complete(struct loader_dri3_pacer *pacer,
    if (!frame || frame->completed)
       return recovered;
 
+   if (current_generation && frame->submitted && now_us >= frame->submitted_us)
+      pacer_add_sample(pacer->submission_completion_us,
+                       &pacer->completion_head, &pacer->completion_count,
+                       now_us - frame->submitted_us);
+
    frame->completed = true;
    frame->completed_us = now_us;
    frame->completed_ust = ust;
@@ -307,6 +323,12 @@ loader_dri3_pacer_note_storage_released(struct loader_dri3_pacer *pacer,
 
    if (!frame || frame->storage_released)
       return;
+
+   if (frame->generation == pacer->generation && frame->submitted &&
+       now_us >= frame->submitted_us)
+      pacer_add_sample(pacer->storage_retention_us,
+                       &pacer->retention_head, &pacer->retention_count,
+                       now_us - frame->submitted_us);
 
    frame->storage_released = true;
    frame->storage_released_us = now_us;
@@ -422,6 +444,12 @@ loader_dri3_pacer_snapshot(const struct loader_dri3_pacer *pacer,
    snapshot->production_p95_us = loader_dri3_pacer_production_p95(pacer);
    snapshot->ready_residence_p95_us =
       pacer_percentile(pacer->ready_residence_us, pacer->residence_count, 95);
+   snapshot->submission_completion_p95_us =
+      pacer_percentile(pacer->submission_completion_us,
+                       pacer->completion_count, 95);
+   snapshot->storage_retention_p95_us =
+      pacer_percentile(pacer->storage_retention_us,
+                       pacer->retention_count, 95);
    snapshot->outstanding_frames = pacer->outstanding_frames;
    snapshot->retained_allocations = pacer->retained_allocations;
    snapshot->timing_valid = pacer->timing_valid;

@@ -41,10 +41,12 @@ test_independent_lifetimes(void)
    loader_dri3_pacer_snapshot(&pacer, 1300, &snapshot);
    assert(snapshot.outstanding_frames == 0);
    assert(snapshot.retained_allocations == 1);
+   assert(snapshot.submission_completion_p95_us == 100);
 
    loader_dri3_pacer_note_storage_released(&pacer, 1, 1400);
    loader_dri3_pacer_snapshot(&pacer, 1400, &snapshot);
    assert(snapshot.retained_allocations == 0);
+   assert(snapshot.storage_retention_p95_us == 200);
    assert(snapshot.stats.completed == 1);
    assert(snapshot.stats.storage_released == 1);
 }
@@ -215,11 +217,16 @@ test_old_generation_feedback_does_not_seed_timeline(void)
    assert(loader_dri3_pacer_reserve(&pacer, 1, 2, 1000, 1100));
    loader_dri3_pacer_note_submitted(&pacer, 1, 1200);
    loader_dri3_pacer_reset_generation(&pacer, 1300);
+   loader_dri3_pacer_note_producer_ready(&pacer, 1, 1350);
+   assert(pacer.production_count == 0);
+   assert(pacer.residence_count == 0);
    loader_dri3_pacer_note_complete(&pacer, 1, 10000, 2, 1400);
    assert(pacer.last_complete_ust == 0);
    assert(pacer.generation_needs_current_completion);
+   assert(pacer.completion_count == 0);
 
    loader_dri3_pacer_note_storage_released(&pacer, 1, 1500);
+   assert(pacer.retention_count == 0);
    assert(loader_dri3_pacer_reserve(&pacer, 2, 3, 1500, 1500));
    loader_dri3_pacer_note_submitted(&pacer, 2, 1600);
    loader_dri3_pacer_note_complete(&pacer, 2, 20000, 3, 1700);
