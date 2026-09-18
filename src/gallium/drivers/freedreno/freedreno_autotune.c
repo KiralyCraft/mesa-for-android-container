@@ -43,6 +43,43 @@ struct fd_batch_history {
  */
 #define FD_AUTOTUNE_SIGNATURE_VERSION 2
 
+#define MAX_TIMING_HISTORIES       64
+#define MAX_TIMING_RESULTS         16
+#define MIN_COMPARE_RESULTS        8
+#define TIMING_IMPROVEMENT_PERCENT 5
+
+enum fd_autotune_timing_mode {
+   FD_AUTOTUNE_TIMING_GMEM,
+   FD_AUTOTUNE_TIMING_SYSMEM,
+   FD_AUTOTUNE_TIMING_MODE_COUNT,
+};
+
+struct fd_autotune_mode_timings {
+   uint64_t duration_ns[MAX_TIMING_RESULTS];
+   uint64_t total_seen;
+   uint8_t count;
+   uint8_t next;
+};
+
+/* DEBUG: observation-only measured-history validation.
+ *
+ * A bounded, in-memory observation history for structurally comparable
+ * render passes.  It is intentionally independent of fd_batch_history:
+ * rotating presentation buffers may have different address-based batch keys
+ * while still representing the same work.
+ *
+ * This history reports a candidate only for validation.  The legacy
+ * samples-passed heuristic remains the sole selection policy.
+ */
+struct fd_autotune_timing_history {
+   uint64_t structural_signature;
+   struct list_head node;
+   struct fd_autotune_mode_timings mode[FD_AUTOTUNE_TIMING_MODE_COUNT];
+};
+
+static void
+log_timing_history(const struct fd_autotune_timing_history *history);
+
 struct fd_autotune_attachment_signature {
    uint32_t pitch;
    uint32_t layer_stride;
@@ -197,6 +234,149 @@ structural_signature(struct fd_batch *batch)
    return ((uint64_t)high << 32) | low;
 }
 
+static struct fd_autotune_timing_history *
+get_timing_history(struct fd_autotune *at, uint64_t signature)
+{
+   if (!at->timing_ht)
+      return NULL;
+
+   struct fd_autotune_timing_history *history =
+      _mesa_hash_table_u64_search(at->timing_ht, signature);
+
+   if (history)
+      goto found;
+
+   history = rzalloc(at->timing_ht, struct fd_autotune_timing_history);
+   if (!history)
+      return NULL;
+
+   history->structural_signature = signature;
+   list_inithead(&history->node);
+
+   if (_mesa_hash_table_u64_num_entries(at->timing_ht) >=
+       MAX_TIMING_HISTORIES) {
+      struct fd_autotune_timing_history *last = list_last_entry(
+         &at->timing_lru, struct fd_autotune_timing_history, node);
+
+      if (unlikely(at->log))
+         log_timing_history(last);
+
+      _mesa_hash_table_u64_remove(at->timing_ht, last->structural_signature);
+      list_del(&last->node);
+      ralloc_free(last);
+   }
+
+   _mesa_hash_table_u64_insert(at->timing_ht, signature, history);
+
+found:
+   list_delinit(&history->node);
+   list_add(&history->node, &at->timing_lru);
+
+   return history;
+}
+
+static void
+record_timing_result(struct fd_autotune *at,
+                     const struct fd_batch_result *result)
+{
+   if (!result->timestamped || !result->duration_ns)
+      return;
+
+   struct fd_autotune_timing_history *history =
+      get_timing_history(at, result->structural_signature);
+   if (!history)
+      return;
+
+   enum fd_autotune_timing_mode mode =
+      result->use_bypass ? FD_AUTOTUNE_TIMING_SYSMEM : FD_AUTOTUNE_TIMING_GMEM;
+   struct fd_autotune_mode_timings *timings = &history->mode[mode];
+
+   timings->duration_ns[timings->next] = result->duration_ns;
+   timings->next = (timings->next + 1) % MAX_TIMING_RESULTS;
+   timings->count = MIN2(timings->count + 1, MAX_TIMING_RESULTS);
+   timings->total_seen++;
+}
+
+struct fd_autotune_timing_summary {
+   uint64_t mean_ns;
+   uint64_t p95_ns;
+};
+
+static struct fd_autotune_timing_summary
+summarize_timings(const struct fd_autotune_mode_timings *timings)
+{
+   uint64_t sorted[MAX_TIMING_RESULTS];
+   uint64_t sum = 0;
+
+   for (unsigned i = 0; i < timings->count; i++) {
+      sorted[i] = timings->duration_ns[i];
+      sum += sorted[i];
+   }
+
+   for (unsigned i = 1; i < timings->count; i++) {
+      uint64_t value = sorted[i];
+      unsigned j = i;
+
+      while (j && sorted[j - 1] > value) {
+         sorted[j] = sorted[j - 1];
+         j--;
+      }
+      sorted[j] = value;
+   }
+
+   if (!timings->count)
+      return (struct fd_autotune_timing_summary){0};
+
+   unsigned p95 = DIV_ROUND_UP(95 * timings->count, 100) - 1;
+
+   return (struct fd_autotune_timing_summary){
+      .mean_ns = sum / timings->count,
+      .p95_ns = sorted[p95],
+   };
+}
+
+static const char *
+timing_candidate(const struct fd_autotune_timing_history *history,
+                 const struct fd_autotune_timing_summary *gmem,
+                 const struct fd_autotune_timing_summary *sysmem)
+{
+   if (history->mode[FD_AUTOTUNE_TIMING_GMEM].count < MIN_COMPARE_RESULTS ||
+       history->mode[FD_AUTOTUNE_TIMING_SYSMEM].count < MIN_COMPARE_RESULTS)
+      return "insufficient";
+
+   const double threshold = (100.0 - TIMING_IMPROVEMENT_PERCENT) / 100.0;
+
+   if (gmem->mean_ns <= sysmem->mean_ns * threshold &&
+       gmem->p95_ns <= sysmem->p95_ns * threshold)
+      return "gmem";
+
+   if (sysmem->mean_ns <= gmem->mean_ns * threshold &&
+       sysmem->p95_ns <= gmem->p95_ns * threshold)
+      return "sysmem";
+
+   return "inconclusive";
+}
+
+static void
+log_timing_history(const struct fd_autotune_timing_history *history)
+{
+   const struct fd_autotune_mode_timings *gmem_timings =
+      &history->mode[FD_AUTOTUNE_TIMING_GMEM];
+   const struct fd_autotune_mode_timings *sysmem_timings =
+      &history->mode[FD_AUTOTUNE_TIMING_SYSMEM];
+   struct fd_autotune_timing_summary gmem = summarize_timings(gmem_timings);
+   struct fd_autotune_timing_summary sysmem = summarize_timings(sysmem_timings);
+
+   mesa_logi("freedreno autotune observation: signature=%016" PRIx64
+             " gmem=%u/%" PRIu64 " mean_ns=%" PRIu64 " p95_ns=%" PRIu64
+             " sysmem=%u/%" PRIu64 " mean_ns=%" PRIu64 " p95_ns=%" PRIu64
+             " candidate=%s policy=unchanged",
+             history->structural_signature, gmem_timings->count,
+             gmem_timings->total_seen, gmem.mean_ns, gmem.p95_ns,
+             sysmem_timings->count, sysmem_timings->total_seen, sysmem.mean_ns,
+             sysmem.p95_ns, timing_candidate(history, &gmem, &sysmem));
+}
+
 static struct fd_batch_history *
 get_history(struct fd_autotune *at, struct fd_batch *batch)
 {
@@ -331,6 +511,8 @@ process_results(struct fd_autotune *at)
       }
 
       if (unlikely(at->log)) {
+         record_timing_result(at, result);
+
          mesa_logi("freedreno autotune: key=%08x signature=%016" PRIx64
                    " draws=%u mode=%s "
                    "samples=%" PRIu64 " duration_ns=%" PRIu64,
@@ -486,11 +668,16 @@ fd_autotune_init(struct fd_autotune *at, struct fd_context *ctx)
       _mesa_hash_table_create(NULL, fd_batch_key_hash, fd_batch_key_equals);
    list_inithead(&at->lru);
 
+   at->log = debug_get_option_autotune_log();
+
+   /* DEBUG: do not allocate or update observation history in normal runs. */
+   at->timing_ht = at->log ? _mesa_hash_table_u64_create(NULL) : NULL;
+   list_inithead(&at->timing_lru);
+
    at->results_mem = fd_bo_new(
       ctx->screen->dev, sizeof(struct fd_autotune_results), 0, "autotune");
    at->results = fd_bo_map(at->results_mem);
    at->ts_to_ns = ctx->ts_to_ns;
-   at->log = debug_get_option_autotune_log();
    at->use_timestamp_completion = ctx->screen->is_kgsl;
 
    if (at->log)
@@ -502,6 +689,13 @@ fd_autotune_init(struct fd_autotune *at, struct fd_context *ctx)
 void
 fd_autotune_fini(struct fd_autotune *at)
 {
+   if (unlikely(at->log) && at->timing_ht) {
+      hash_table_u64_foreach (at->timing_ht, entry) {
+         log_timing_history(entry.data);
+      }
+   }
+
    _mesa_hash_table_destroy(at->ht, NULL);
+   _mesa_hash_table_u64_destroy(at->timing_ht);
    fd_bo_del(at->results_mem);
 }

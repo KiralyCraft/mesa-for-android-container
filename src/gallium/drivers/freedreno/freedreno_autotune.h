@@ -69,6 +69,15 @@ struct fd_autotune {
     */
    struct list_head lru;
 
+   /** DEBUG: observation-only measured-history validation.
+    * Address-independent whole-pass timing observations, keyed by the
+    * structural signature.  This history is deliberately separate from the
+    * existing framebuffer-key history and does not participate in render-mode
+    * selection yet.
+    */
+   struct hash_table_u64 *timing_ht;
+   struct list_head timing_lru;
+
    /**
     * GPU buffer used to communicate back results to the CPU
     */
