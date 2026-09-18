@@ -48,6 +48,7 @@ struct fd_batch_history {
 #define MAX_TIMING_HISTORIES       64
 #define MAX_TIMING_RESULTS         32
 #define MIN_COMPARE_RESULTS        32
+#define MIN_TRAINING_OCCURRENCES   8
 #define TIMING_IMPROVEMENT_PERCENT 5
 
 enum fd_autotune_timing_mode {
@@ -84,6 +85,7 @@ struct fd_autotune_timing_history {
    uint64_t structural_signature;
    struct list_head node;
    struct fd_autotune_mode_timings mode[FD_AUTOTUNE_TIMING_MODE_COUNT];
+   uint64_t eligible_occurrences;
    uint64_t training_scheduled[FD_AUTOTUNE_TIMING_MODE_COUNT];
    enum fd_autotune_timing_candidate locked_candidate;
    bool candidate_locked;
@@ -398,6 +400,8 @@ timing_decision_name(const struct fd_autotune_timing_history *history)
    if (history->training_scheduled[FD_AUTOTUNE_TIMING_GMEM] ||
        history->training_scheduled[FD_AUTOTUNE_TIMING_SYSMEM])
       return "training";
+   if (history->eligible_occurrences)
+      return "warmup";
    return "unchanged";
 }
 
@@ -418,16 +422,17 @@ log_timing_history(const struct fd_autotune *at,
       "freedreno autotune observation: signature=%016" PRIx64
       " gmem=%u/%" PRIu64 " mean_ns=%" PRIu64 " p95_ns=%" PRIu64
       " sysmem=%u/%" PRIu64 " mean_ns=%" PRIu64 " p95_ns=%" PRIu64
+      " eligible=%" PRIu64
       " training_scheduled=%" PRIu64 "/%" PRIu64
       " candidate=%s decision=%s policy=%s",
       history->structural_signature, gmem_timings->count,
       gmem_timings->total_seen, gmem.mean_ns, gmem.p95_ns,
       sysmem_timings->count, sysmem_timings->total_seen, sysmem.mean_ns,
-      sysmem.p95_ns, history->training_scheduled[FD_AUTOTUNE_TIMING_GMEM],
+      sysmem.p95_ns, history->eligible_occurrences,
+      history->training_scheduled[FD_AUTOTUNE_TIMING_GMEM],
       history->training_scheduled[FD_AUTOTUNE_TIMING_SYSMEM],
       timing_candidate_name(candidate), timing_decision_name(history),
-      (at->measured && (history->training_scheduled[FD_AUTOTUNE_TIMING_GMEM] ||
-                        history->training_scheduled[FD_AUTOTUNE_TIMING_SYSMEM]))
+      (at->measured && history->eligible_occurrences)
          ? "measured"
          : "unchanged");
 }
@@ -478,6 +483,15 @@ measured_use_bypass(struct fd_autotune *at, struct fd_batch *batch,
    struct fd_autotune_timing_history *history =
       get_timing_history(at, batch->autotune_result->structural_signature);
    if (!history)
+      return legacy_use_bypass;
+
+   /* DEBUG: Do not perturb rare or one-off passes.  First establish that a
+    * structural signature recurs, using only the established heuristic.  The
+    * asynchronous timings collected during this warmup remain useful, but
+    * balanced mode exploration starts only on a later occurrence.
+    */
+   history->eligible_occurrences++;
+   if (history->eligible_occurrences <= MIN_TRAINING_OCCURRENCES)
       return legacy_use_bypass;
 
    const struct fd_autotune_mode_timings *gmem =
