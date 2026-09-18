@@ -105,6 +105,7 @@ dri3_present_job_execute(void *data, void *gdata, int thread_index)
       { .fd = job->fence_fd, .events = POLLIN },
       { .fd = job->cancel_fd, .events = POLLIN },
    };
+   uint64_t producer_ready_us;
    int ret;
 
    do {
@@ -131,6 +132,11 @@ dri3_present_job_execute(void *data, void *gdata, int thread_index)
       return;
    }
 
+   /* Record readiness at the fence wakeup.  Publishing the observation into
+    * the drawable ledger can be delayed by a concurrent commitment wait
+    * holding draw->mtx; that mutex delay is not GPU production time. */
+   producer_ready_us = os_time_get();
+
    /* Queue TriggerFence under XCB's connection lock before publishing the
     * state.  Any ResetFence submitted by the reuse thread after observing the
     * state is therefore serialized after this trigger request.
@@ -141,7 +147,7 @@ dri3_present_job_execute(void *data, void *gdata, int thread_index)
 
    mtx_lock(&job->draw->mtx);
    loader_dri3_pacer_note_producer_ready(&job->draw->pacer, job->serial,
-                                         os_time_get());
+                                         producer_ready_us);
    mtx_unlock(&job->draw->mtx);
 }
 
