@@ -1582,6 +1582,45 @@ loader_dri3_swap_buffers_msc(struct loader_dri3_drawable *draw,
 
    dri3_flush_present_events(draw);
 
+   /* A paced drawable permits one frame to be produced while its predecessor
+    * is committed to the presentation backend.  Do not turn the allocation
+    * pool into an implicit Present queue: wait for that submission slot before
+    * committing the frame which was just flushed.
+    *
+    * The producer work and its native fence have already been submitted.  The
+    * wait below therefore cannot prevent the dependency from making progress,
+    * and the eventual Present request still carries the PR96 X wait-fence
+    * bridge.  A timing timeout only disables pacing; it never removes the
+    * producer dependency.
+    */
+   if (paced_present && draw->recv_sbc != draw->send_sbc) {
+      uint64_t wait_start_us = os_time_get();
+      int timeout_ms = MAX2((int) DIV_ROUND_UP(draw->pacing_period_us * 3,
+                                               1000),
+                            100);
+      uint64_t wait_deadline_us = wait_start_us + timeout_ms * 1000ULL;
+
+      draw->pacing_wait_count++;
+      while (draw->recv_sbc != draw->send_sbc) {
+         int64_t remaining_us = wait_deadline_us - os_time_get();
+         int remaining_ms = remaining_us > 0 ?
+            DIV_ROUND_UP(remaining_us, 1000) : 0;
+
+         if (!remaining_ms ||
+             !dri3_wait_for_event_locked_timeout(draw, remaining_ms)) {
+            draw->pacing_timeout_count++;
+            draw->pacing_timed_out = true;
+            paced_present = false;
+            mesa_loge("DRI3: paced Present feedback stale for %d ms; "
+                      "temporarily falling back to synchronized unpaced "
+                      "presentation",
+                      timeout_ms);
+            break;
+         }
+      }
+      draw->pacing_wait_us += os_time_get() - wait_start_us;
+   }
+
    if (draw->type == LOADER_DRI3_DRAWABLE_WINDOW) {
       dri3_fence_reset(draw->conn, back);
 
@@ -1611,9 +1650,7 @@ loader_dri3_swap_buffers_msc(struct loader_dri3_drawable *draw,
           * Nth request at the next vblank. [1 .. N-1] requests are skipped.
           */
          if (paced_present) {
-            uint64_t outstanding = draw->send_sbc - draw->recv_sbc;
-
-            target_msc = draw->msc + outstanding + 1;
+            target_msc = draw->msc + 1;
          } else if (draw->swap_interval != 0) {
             while (draw->recv_sbc != draw->send_sbc) {
                if (!dri3_wait_for_event_locked(draw, NULL))
@@ -1749,33 +1786,6 @@ loader_dri3_swap_buffers_msc(struct loader_dri3_drawable *draw,
    }
 
    xcb_flush(draw->conn);
-
-   if (paced_present && draw->send_sbc - draw->recv_sbc >= 2) {
-      uint64_t wait_start_us = os_time_get();
-      int timeout_ms = MAX2((int) DIV_ROUND_UP(draw->pacing_period_us * 3,
-                                               1000),
-                            100);
-      uint64_t wait_deadline_us = wait_start_us + timeout_ms * 1000ULL;
-
-      draw->pacing_wait_count++;
-      while (draw->send_sbc - draw->recv_sbc >= 2) {
-         int64_t remaining_us = wait_deadline_us - os_time_get();
-         int remaining_ms = remaining_us > 0 ?
-            DIV_ROUND_UP(remaining_us, 1000) : 0;
-
-         if (!remaining_ms ||
-             !dri3_wait_for_event_locked_timeout(draw, remaining_ms)) {
-            draw->pacing_timeout_count++;
-            draw->pacing_timed_out = true;
-            mesa_loge("DRI3: paced Present feedback stale for %d ms; "
-                      "temporarily falling back to synchronized unpaced "
-                      "presentation",
-                      timeout_ms);
-            break;
-         }
-      }
-      draw->pacing_wait_us += os_time_get() - wait_start_us;
-   }
 
    if (draw->stamp)
       ++(*draw->stamp);
