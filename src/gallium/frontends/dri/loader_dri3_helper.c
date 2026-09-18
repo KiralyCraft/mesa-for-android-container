@@ -2451,6 +2451,7 @@ dri3_alloc_render_buffer(struct loader_dri3_drawable *draw, unsigned int fourcc,
    if (draw->experimental_consumer_owned_alloc &&
        draw->type == LOADER_DRI3_DRAWABLE_WINDOW &&
        draw->dri_screen_render_gpu == draw->dri_screen_display_gpu &&
+       draw->dri_screen_render_gpu->dmabuf_import &&
        draw->multiplanes_available && !draw->is_protected_content &&
        (fourcc == DRM_FORMAT_XRGB8888 || fourcc == DRM_FORMAT_ARGB8888) &&
        dri3_try_alloc_consumer_owned(draw, buffer, fourcc, width, height,

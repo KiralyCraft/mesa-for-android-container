@@ -94,7 +94,13 @@ bool fd_binning_enabled = true;
 static bool
 fd_kgsl_dmabuf_enabled(void)
 {
-   return debug_get_bool_option("FD_KGSL_ENABLE_DMABUF", false) ||
+   /* DEBUG: The consumer-owned DRI3 allocation experiment necessarily
+    * imports Android dma-bufs.  Make its single opt-in switch sufficient to
+    * expose the existing KGSL import path; all production defaults remain
+    * unchanged while the experiment is disabled. */
+   return debug_get_bool_option("MESA_DRI3_EXPERIMENTAL_CONSUMER_ALLOC",
+                                false) ||
+          debug_get_bool_option("FD_KGSL_ENABLE_DMABUF", false) ||
           debug_get_bool_option("XWAYLAND_FORCE_KGSL_SURFACELESS", false);
 }
 
