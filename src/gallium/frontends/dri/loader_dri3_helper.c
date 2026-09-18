@@ -97,6 +97,13 @@ enum dri3_present_wait_status {
 #define LORIE_PRESENT_CAP_VBLANK_COMPLETE         (1u << 30)
 #define LORIE_PRESENT_CAP_FRAME_TIMELINE          (1u << 31)
 
+/* Xlib may read the shared XCB socket on another thread and enqueue a Present
+ * special event after our queue check.  The socket is no longer readable in
+ * that case, so a single poll lasting until the stale-timeline deadline would
+ * miss an event already held by XCB.  Recheck the special queue frequently;
+ * ordinary admission pacing normally avoids this wait altogether. */
+#define DRI3_PRESENT_EVENT_POLL_SLICE_MS 2
+
 static void
 dri3_present_job_execute(void *data, void *gdata, int thread_index)
 {
@@ -1126,16 +1133,20 @@ dri3_wait_for_event_locked_timeout(struct loader_dri3_drawable *draw,
          .fd = xcb_get_file_descriptor(draw->conn),
          .events = POLLIN,
       };
+      int poll_timeout_ms;
       int ret;
 
       if (remaining_ns <= 0)
          break;
 
+      poll_timeout_ms = MIN2(DIV_ROUND_UP(remaining_ns, 1000000),
+                             DRI3_PRESENT_EVENT_POLL_SLICE_MS);
+
       do {
-         ret = poll(&pfd, 1, DIV_ROUND_UP(remaining_ns, 1000000));
+         ret = poll(&pfd, 1, poll_timeout_ms);
       } while (ret < 0 && errno == EINTR);
 
-      if (ret <= 0 || (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)))
+      if (ret < 0 || (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)))
          break;
    }
 
