@@ -24,6 +24,30 @@
 #include "freedreno_state.h"
 #include "freedreno_util.h"
 
+#define FD_SHADER_SIGNATURE_OFFSET UINT64_C(14695981039346656037)
+#define FD_SHADER_SIGNATURE_PRIME  UINT64_C(1099511628211)
+
+static void
+track_program_signature(struct fd_batch *batch) assert_dt
+{
+   uint64_t program_signature = batch->ctx->program_source_signature;
+
+   /* Draw-count buckets already capture repetitions.  Hash transitions here
+    * so batches with the same program sequence compare across rotating BOs
+    * without making repeated draws of one program address-dependent.
+    */
+   if (batch->num_draws && program_signature == batch->last_program_signature)
+      return;
+
+   if (!batch->num_shader_programs)
+      batch->shader_signature = FD_SHADER_SIGNATURE_OFFSET;
+
+   batch->shader_signature ^= program_signature;
+   batch->shader_signature *= FD_SHADER_SIGNATURE_PRIME;
+   batch->last_program_signature = program_signature;
+   batch->num_shader_programs++;
+}
+
 static bool
 batch_references_resource(struct fd_batch *batch, struct pipe_resource *prsc)
    assert_dt
@@ -356,6 +380,8 @@ fd_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
       batch_draw_tracking(batch, info, indirect);
       assert(ctx->batch == batch);
    }
+
+   track_program_signature(batch);
 
    batch->num_draws++;
    batch->subpass->num_draws++;

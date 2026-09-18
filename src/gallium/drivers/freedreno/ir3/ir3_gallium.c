@@ -10,6 +10,7 @@
 #include "pipe/p_state.h"
 #include "tgsi/tgsi_dump.h"
 #include "util/format/u_format.h"
+#include "util/hash_table.h"
 #include "util/u_inlines.h"
 #include "util/u_memory.h"
 #include "util/u_string.h"
@@ -37,9 +38,32 @@
 struct ir3_shader_state {
    struct ir3_shader *shader;
 
+   /* Stable across object addresses and process runs. */
+   uint64_t source_signature;
+
    /* Fence signalled when async compile is completed: */
    struct util_queue_fence ready;
 };
+
+static uint64_t
+shader_source_signature(const struct ir3_shader *shader)
+{
+   struct {
+      blake3_hash source;
+      cache_key cache;
+      uint32_t stage;
+   } key;
+
+   memset(&key, 0, sizeof(key));
+   memcpy(key.source, shader->nir->info.source_blake3, sizeof(key.source));
+   memcpy(key.cache, shader->cache_key, sizeof(key.cache));
+   key.stage = shader->type;
+
+   uint32_t low = _mesa_hash_data(&key, sizeof(key));
+   uint32_t high = _mesa_hash_data_with_seed(&key, sizeof(key), 0x9e3779b9);
+
+   return ((uint64_t)high << 32) | low;
+}
 
 /**
  * Should initial variants be compiled synchronously?
@@ -271,6 +295,7 @@ ir3_shader_compute_state_create(struct pipe_context *pctx,
 
    util_queue_fence_init(&hwcso->ready);
    hwcso->shader = shader;
+   hwcso->source_signature = shader_source_signature(shader);
 
    /* Immediately compile a standard variant.  We have so few variants in our
     * shaders, that doing so almost eliminates draw-time recompiles.  (This
@@ -339,6 +364,7 @@ ir3_shader_state_create(struct pipe_context *pctx,
                               .api_wavesize = api_wavesize,
                               .real_wavesize = real_wavesize,
                           });
+   hwcso->source_signature = shader_source_signature(hwcso->shader);
 
    /*
     * Create initial variants to avoid draw-time stalls.  This is
@@ -412,6 +438,12 @@ ir3_get_shader(struct ir3_shader_state *hwcso)
    }
 
    return shader;
+}
+
+uint64_t
+ir3_shader_state_source_signature(struct ir3_shader_state *hwcso)
+{
+   return hwcso ? hwcso->source_signature : 0;
 }
 
 struct shader_info *

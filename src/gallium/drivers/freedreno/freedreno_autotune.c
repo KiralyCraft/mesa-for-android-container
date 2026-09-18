@@ -41,7 +41,7 @@ struct fd_batch_history {
  * Keep this as an explicitly versioned, zero-initialized fixed layout so that
  * compiler padding cannot make otherwise identical passes hash differently.
  */
-#define FD_AUTOTUNE_SIGNATURE_VERSION 1
+#define FD_AUTOTUNE_SIGNATURE_VERSION 2
 
 struct fd_autotune_attachment_signature {
    uint32_t pitch;
@@ -71,12 +71,14 @@ struct fd_autotune_structural_signature {
    uint32_t restore;
    uint32_t resolve;
    uint32_t gmem_reason;
+   uint64_t shader_signature;
    uint16_t layers;
    uint8_t samples;
    uint8_t nr_cbufs;
    uint8_t draw_bucket;
    uint8_t cost_bucket;
    uint8_t subpass_bucket;
+   uint8_t shader_program_bucket;
    uint8_t flags;
    uint8_t scissor_minx;
    uint8_t scissor_miny;
@@ -165,11 +167,13 @@ structural_signature(struct fd_batch *batch)
    signature.restore = batch->restore;
    signature.resolve = batch->resolve;
    signature.gmem_reason = batch->gmem_reason;
+   signature.shader_signature = batch->shader_signature;
    signature.layers = pfb->layers;
    signature.samples = pfb->samples;
    signature.nr_cbufs = pfb->nr_cbufs;
    signature.draw_bucket = bucket_u32(batch->num_draws);
    signature.cost_bucket = bucket_u32(batch->cost);
+   signature.shader_program_bucket = bucket_u32(batch->num_shader_programs);
    signature.flags = (pfb->pls_enabled ? BITFIELD_BIT(0) : 0) |
                      (batch->tessellation ? BITFIELD_BIT(1) : 0);
    signature.scissor_minx = quantize_coordinate(scissor->minx, pfb->width);

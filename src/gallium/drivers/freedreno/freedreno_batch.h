@@ -163,6 +163,11 @@ struct fd_batch {
     */
    unsigned cost;
 
+   /* Address-independent sequence of distinct bound shader programs. */
+   uint64_t shader_signature;
+   uint64_t last_program_signature;
+   unsigned num_shader_programs;
+
    /* Tells the gen specific backend where to write stats used for
     * the autotune module.
     *

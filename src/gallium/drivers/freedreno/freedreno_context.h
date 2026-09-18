@@ -478,6 +478,7 @@ struct fd_context {
    struct fd_texture_stateobj tex[MESA_SHADER_STAGES] dt;
 
    struct fd_program_stateobj prog dt;
+   uint64_t program_source_signature dt;
    uint32_t bound_shader_stages dt;
 
    struct fd_vertex_state vtx dt;

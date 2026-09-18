@@ -35,6 +35,7 @@ void ir3_shader_state_delete(struct pipe_context *pctx, void *hwcso);
 
 struct ir3_shader *ir3_get_shader(struct ir3_shader_state *hwcso);
 struct shader_info *ir3_get_shader_info(struct ir3_shader_state *hwcso);
+uint64_t ir3_shader_state_source_signature(struct ir3_shader_state *hwcso);
 
 void ir3_fixup_shader_state(struct pipe_context *pctx,
                             struct ir3_shader_key *key) assert_dt;

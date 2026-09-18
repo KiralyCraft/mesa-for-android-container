@@ -11,8 +11,33 @@
 
 #include "util/u_simple_shaders.h"
 
+#include "ir3/ir3_gallium.h"
 #include "freedreno_context.h"
 #include "freedreno_program.h"
+
+#define FD_SHADER_SIGNATURE_OFFSET UINT64_C(14695981039346656037)
+#define FD_SHADER_SIGNATURE_PRIME  UINT64_C(1099511628211)
+
+static void
+update_program_source_signature(struct fd_context *ctx) assert_dt
+{
+   if (!is_ir3(ctx->screen)) {
+      ctx->program_source_signature = 0;
+      return;
+   }
+
+   struct ir3_shader_state *stages[] = {
+      ctx->prog.vs, ctx->prog.hs, ctx->prog.ds, ctx->prog.gs, ctx->prog.fs,
+   };
+   uint64_t signature = FD_SHADER_SIGNATURE_OFFSET;
+
+   for (unsigned i = 0; i < ARRAY_SIZE(stages); i++) {
+      signature ^= ir3_shader_state_source_signature(stages[i]);
+      signature *= FD_SHADER_SIGNATURE_PRIME;
+   }
+
+   ctx->program_source_signature = signature;
+}
 
 static void
 update_bound_stage(struct fd_context *ctx, mesa_shader_stage shader,
@@ -72,6 +97,7 @@ fd_vs_state_bind(struct pipe_context *pctx, void *hwcso) in_dt
 {
    struct fd_context *ctx = fd_context(pctx);
    ctx->prog.vs = hwcso;
+   update_program_source_signature(ctx);
    fd_context_dirty_shader(ctx, MESA_SHADER_VERTEX, FD_DIRTY_SHADER_PROG);
    update_bound_stage(ctx, MESA_SHADER_VERTEX, !!hwcso);
 }
@@ -81,6 +107,7 @@ fd_tcs_state_bind(struct pipe_context *pctx, void *hwcso) in_dt
 {
    struct fd_context *ctx = fd_context(pctx);
    ctx->prog.hs = hwcso;
+   update_program_source_signature(ctx);
    fd_context_dirty_shader(ctx, MESA_SHADER_TESS_CTRL, FD_DIRTY_SHADER_PROG);
    update_bound_stage(ctx, MESA_SHADER_TESS_CTRL, !!hwcso);
 }
@@ -90,6 +117,7 @@ fd_tes_state_bind(struct pipe_context *pctx, void *hwcso) in_dt
 {
    struct fd_context *ctx = fd_context(pctx);
    ctx->prog.ds = hwcso;
+   update_program_source_signature(ctx);
    fd_context_dirty_shader(ctx, MESA_SHADER_TESS_EVAL, FD_DIRTY_SHADER_PROG);
    update_bound_stage(ctx, MESA_SHADER_TESS_EVAL, !!hwcso);
 }
@@ -99,6 +127,7 @@ fd_gs_state_bind(struct pipe_context *pctx, void *hwcso) in_dt
 {
    struct fd_context *ctx = fd_context(pctx);
    ctx->prog.gs = hwcso;
+   update_program_source_signature(ctx);
    fd_context_dirty_shader(ctx, MESA_SHADER_GEOMETRY, FD_DIRTY_SHADER_PROG);
    update_bound_stage(ctx, MESA_SHADER_GEOMETRY, !!hwcso);
 }
@@ -108,6 +137,7 @@ fd_fs_state_bind(struct pipe_context *pctx, void *hwcso) in_dt
 {
    struct fd_context *ctx = fd_context(pctx);
    ctx->prog.fs = hwcso;
+   update_program_source_signature(ctx);
    fd_context_dirty_shader(ctx, MESA_SHADER_FRAGMENT, FD_DIRTY_SHADER_PROG);
    update_bound_stage(ctx, MESA_SHADER_FRAGMENT, !!hwcso);
 }
