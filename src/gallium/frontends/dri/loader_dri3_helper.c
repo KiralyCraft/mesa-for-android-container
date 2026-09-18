@@ -23,6 +23,7 @@
 
 #include <fcntl.h>
 #include <errno.h>
+#include <inttypes.h>
 #include <poll.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -44,7 +45,9 @@
 #include "util/libsync.h"
 #include "util/log.h"
 #include "util/macros.h"
+#include "util/os_time.h"
 #include "util/u_atomic.h"
+#include "util/u_debug.h"
 #include "util/u_queue.h"
 #include "util/simple_mtx.h"
 #include "drm-uapi/drm_fourcc.h"
@@ -74,10 +77,23 @@ struct loader_dri3_present_sync {
 struct loader_dri3_present_job {
    xcb_connection_t *conn;
    xcb_sync_fence_t fence;
-   int *fence_triggered;
+   int *fence_status;
    int fence_fd;
    int cancel_fd;
 };
+
+enum dri3_present_wait_status {
+   DRI3_PRESENT_WAIT_PENDING,
+   DRI3_PRESENT_WAIT_TRIGGERED,
+   DRI3_PRESENT_WAIT_FAILED,
+};
+
+#define DRI3_PRESENT_WAIT_FENCE_FAILED ((xcb_sync_fence_t) UINT32_MAX)
+
+/* Private Termux:X11 Present capability bits. */
+#define LORIE_PRESENT_CAP_WAIT_FENCE_REQUEUE_SAFE (1u << 29)
+#define LORIE_PRESENT_CAP_VBLANK_COMPLETE         (1u << 30)
+#define LORIE_PRESENT_CAP_FRAME_TIMELINE          (1u << 31)
 
 static void
 dri3_present_job_execute(void *data, void *gdata, int thread_index)
@@ -96,24 +112,29 @@ dri3_present_job_execute(void *data, void *gdata, int thread_index)
    if (ret < 0) {
       mesa_loge("DRI3: failed to wait for presentation fence: %s",
                 strerror(errno));
+      p_atomic_set(job->fence_status, DRI3_PRESENT_WAIT_FAILED);
+      return;
    }
 
-   if (ret > 0 && fds[1].revents)
+   if (fds[1].revents) {
+      p_atomic_set(job->fence_status, DRI3_PRESENT_WAIT_FAILED);
       return;
+   }
 
-   /* A sync_file normally signals with POLLIN.  Trigger on an error too so a
-    * broken fence cannot leave the X server permanently blocked.
-    */
-   if (ret > 0 && !(fds[0].revents & POLLIN))
-      mesa_loge("DRI3: presentation fence reported poll events 0x%x",
+   if (!(fds[0].revents & POLLIN)) {
+      mesa_loge("DRI3: presentation fence reported poll events 0x%x; "
+                "the Present dependency will remain unsignalled",
                 fds[0].revents);
+      p_atomic_set(job->fence_status, DRI3_PRESENT_WAIT_FAILED);
+      return;
+   }
 
    /* Queue TriggerFence under XCB's connection lock before publishing the
     * state.  Any ResetFence submitted by the reuse thread after observing the
     * state is therefore serialized after this trigger request.
-    */
+   */
    xcb_sync_trigger_fence(job->conn, job->fence);
-   p_atomic_set(job->fence_triggered, true);
+   p_atomic_set(job->fence_status, DRI3_PRESENT_WAIT_TRIGGERED);
    xcb_flush(job->conn);
 }
 
@@ -134,7 +155,9 @@ dri3_present_sync_fini(struct loader_dri3_drawable *draw)
    if (!sync)
       return;
 
-   eventfd_write(sync->cancel_fd, 1);
+   /* A submitted Present may still depend on one of these jobs.  Do not
+    * cancel it: destroying an untriggered X wait fence would remove the
+    * dependency while its producer can still be writing. */
    util_queue_finish(&sync->queue);
    util_queue_destroy(&sync->queue);
    close(sync->cancel_fd);
@@ -232,32 +255,41 @@ dri3_queue_present_wait_fence(struct loader_dri3_drawable *draw,
    if (!draw->present_sync || !buffer->present_wait_fence)
       goto sync_fallback;
 
-   job = calloc(1, sizeof(*job));
-   if (!job)
-      goto sync_fallback;
-
-   job->conn = draw->conn;
-   job->fence = buffer->present_wait_fence;
-   job->fence_triggered = &buffer->present_wait_fence_triggered;
-   job->fence_fd = fence_fd;
-   job->cancel_fd = draw->present_sync->cancel_fd;
-
    /* A skipped Present can release its pixmap before the render fence has
     * signaled. Buffer idleness therefore does not imply that the previous
     * worker is done with this reusable X Sync fence. Finish that job before
     * resetting the fence or associating it with another submission.
-    */
+   */
    util_queue_fence_wait(&buffer->present_wait_job);
+
+   if (p_atomic_read(&buffer->present_wait_fence_status) ==
+       DRI3_PRESENT_WAIT_FAILED) {
+      mesa_loge("DRI3: refusing to reuse a failed Present wait fence");
+      close(fence_fd);
+      return DRI3_PRESENT_WAIT_FENCE_FAILED;
+   }
 
    /* A Sync fence remains triggered until its owner resets it.  Reset only
     * after our previous worker has triggered this per-buffer fence; resetting
     * an unsignaled fence is a Sync Match error.  XCB serializes the reset
     * before the new worker's trigger request on the shared connection.
     */
-   if (p_atomic_read(&buffer->present_wait_fence_triggered)) {
+   if (p_atomic_read(&buffer->present_wait_fence_status) ==
+       DRI3_PRESENT_WAIT_TRIGGERED) {
       xcb_sync_reset_fence(draw->conn, buffer->present_wait_fence);
-      p_atomic_set(&buffer->present_wait_fence_triggered, false);
+      p_atomic_set(&buffer->present_wait_fence_status,
+                   DRI3_PRESENT_WAIT_PENDING);
    }
+
+   job = calloc(1, sizeof(*job));
+   if (!job)
+      goto sync_fallback;
+
+   job->conn = draw->conn;
+   job->fence = buffer->present_wait_fence;
+   job->fence_status = &buffer->present_wait_fence_status;
+   job->fence_fd = fence_fd;
+   job->cancel_fd = draw->present_sync->cancel_fd;
 
    util_queue_add_job(&draw->present_sync->queue, job, &buffer->present_wait_job,
                       dri3_present_job_execute, dri3_present_job_cleanup,
@@ -265,9 +297,12 @@ dri3_queue_present_wait_fence(struct loader_dri3_drawable *draw,
    return buffer->present_wait_fence;
 
 sync_fallback:
-   if (sync_wait(fence_fd, -1))
+   if (sync_wait(fence_fd, -1)) {
       mesa_loge("DRI3: failed to wait for presentation fence: %s",
                 strerror(errno));
+      close(fence_fd);
+      return DRI3_PRESENT_WAIT_FENCE_FAILED;
+   }
    close(fence_fd);
    return XCB_NONE;
 }
@@ -290,6 +325,63 @@ get_screen_for_root(xcb_connection_t *conn, xcb_window_t root)
    }
 
    return NULL;
+}
+
+static enum loader_dri3_present_mode
+dri3_parse_present_mode(const char *mode)
+{
+   if (!mode || !strcmp(mode, "unpaced"))
+      return LOADER_DRI3_PRESENT_UNPACED;
+   if (!strcmp(mode, "auto"))
+      return LOADER_DRI3_PRESENT_AUTO;
+   if (!strcmp(mode, "paced"))
+      return LOADER_DRI3_PRESENT_PACED;
+
+   mesa_loge("DRI3: unknown present mode '%s'; using unpaced", mode);
+   return LOADER_DRI3_PRESENT_UNPACED;
+}
+
+static uint32_t
+dri3_query_present_capabilities(xcb_connection_t *conn,
+                                xcb_drawable_t drawable)
+{
+   xcb_present_query_capabilities_cookie_t cookie =
+      xcb_present_query_capabilities(conn, drawable);
+   xcb_present_query_capabilities_reply_t *reply =
+      xcb_present_query_capabilities_reply(conn, cookie, NULL);
+   uint32_t capabilities = reply ? reply->capabilities : 0;
+
+   free(reply);
+   return capabilities;
+}
+
+static bool
+dri3_pacing_supported(const struct loader_dri3_drawable *draw)
+{
+   const uint32_t required = LORIE_PRESENT_CAP_WAIT_FENCE_REQUEUE_SAFE |
+                             LORIE_PRESENT_CAP_VBLANK_COMPLETE |
+                             LORIE_PRESENT_CAP_FRAME_TIMELINE;
+
+   return draw->present_mode != LOADER_DRI3_PRESENT_UNPACED &&
+          !draw->pacing_timed_out &&
+          draw->type == LOADER_DRI3_DRAWABLE_WINDOW &&
+          draw->present_sync &&
+          (draw->present_capabilities & required) == required;
+}
+
+static bool
+dri3_present_sync_faulted(const struct loader_dri3_drawable *draw)
+{
+   for (unsigned i = 0; i < ARRAY_SIZE(draw->buffers); i++) {
+      const struct loader_dri3_buffer *buffer = draw->buffers[i];
+
+      if (buffer && buffer->present_wait_fence &&
+          p_atomic_read(&buffer->present_wait_fence_status) ==
+          DRI3_PRESENT_WAIT_FAILED)
+         return true;
+   }
+
+   return false;
 }
 
 /* Error checking helpers for xcb_ functions. Use it to avoid late
@@ -487,6 +579,20 @@ dri3_fence_await(xcb_connection_t *c, struct loader_dri3_drawable *draw,
 static void
 dri3_update_max_num_back(struct loader_dri3_drawable *draw)
 {
+   const uint32_t pacing_caps =
+      LORIE_PRESENT_CAP_WAIT_FENCE_REQUEUE_SAFE |
+      LORIE_PRESENT_CAP_VBLANK_COMPLETE |
+      LORIE_PRESENT_CAP_FRAME_TIMELINE;
+
+   if (draw->present_mode != LOADER_DRI3_PRESENT_UNPACED &&
+       !draw->pacing_timed_out && draw->swap_interval == 0 &&
+       (draw->present_capabilities & pacing_caps) == pacing_caps) {
+      /* Allocation capacity is independent from permission to render ahead.
+       * Two buffers are sufficient for the initial bounded FIFO policy. */
+      draw->max_num_back = 2;
+      return;
+   }
+
    switch (draw->last_present_mode) {
    case XCB_PRESENT_COMPLETE_MODE_FLIP: {
       if (draw->swap_interval == 0)
@@ -562,6 +668,20 @@ dri3_free_render_buffer(struct loader_dri3_drawable *draw,
    if (buffer->present_wait_fence && draw->present_sync)
       util_queue_fence_wait(&buffer->present_wait_job);
 
+   if (buffer->present_wait_fence &&
+       p_atomic_read(&buffer->present_wait_fence_status) ==
+       DRI3_PRESENT_WAIT_FAILED) {
+      /* The server can still hold a Present request waiting on this fence.
+       * Keep the pixmap, X fence, and images quarantined rather than turning
+       * an unfinished producer into a ready buffer during teardown. */
+      mesa_loge("DRI3: quarantining buffer %u after a failed producer fence",
+                buffer->pixmap);
+      draw->buffers[buf_id] = NULL;
+      if (buf_id != LOADER_DRI3_FRONT_ID)
+         draw->cur_num_back--;
+      return;
+   }
+
    if (buffer->present_wait_fence) {
       util_queue_fence_destroy(&buffer->present_wait_job);
       xcb_sync_destroy_fence(draw->conn, buffer->present_wait_fence);
@@ -583,6 +703,14 @@ void
 loader_dri3_drawable_fini(struct loader_dri3_drawable *draw)
 {
    int i;
+
+   if (draw->pacing_trace &&
+       (draw->pacing_wait_count || draw->pacing_timeout_count)) {
+      mesa_logi("DRI3 pacing: waits=%" PRIu64 " wait_us=%" PRIu64
+                " timeouts=%" PRIu64 " completes=%" PRIu64,
+                draw->pacing_wait_count, draw->pacing_wait_us,
+                draw->pacing_timeout_count, draw->pacing_complete_count);
+   }
 
    dri3_present_sync_fini(draw);
    driDestroyDrawable(draw->dri_drawable);
@@ -634,6 +762,11 @@ loader_dri3_drawable_init(xcb_connection_t *conn,
    draw->queries_buffer_age = false;
    draw->present_sync_checked = false;
    draw->present_sync = NULL;
+   draw->present_mode = LOADER_DRI3_PRESENT_UNPACED;
+   draw->present_capabilities = 0;
+   draw->pacing_timed_out = false;
+   draw->pacing_trace = false;
+   draw->pacing_period_us = 16667;
 
    draw->have_back = 0;
    draw->have_fake_front = 0;
@@ -650,6 +783,8 @@ loader_dri3_drawable_init(xcb_connection_t *conn,
    {
       unsigned char adaptive_sync = 0;
       unsigned char block_on_depleted_buffers = 0;
+      char *present_mode = NULL;
+      const char *present_mode_env = getenv("MESA_DRI3_PRESENT_MODE");
 
       dri2GalliumConfigQueryb(draw->dri_screen_render_gpu,
                                       "adaptive_sync",
@@ -662,6 +797,17 @@ loader_dri3_drawable_init(xcb_connection_t *conn,
                                       &block_on_depleted_buffers);
 
       draw->block_on_depleted_buffers = block_on_depleted_buffers;
+
+      if (!present_mode_env &&
+          dri2GalliumConfigQuerys(draw->dri_screen_render_gpu,
+                                  "dri3_present_mode", &present_mode) != 0)
+         present_mode = NULL;
+
+      draw->present_mode =
+         dri3_parse_present_mode(present_mode_env ? present_mode_env :
+                                                    present_mode);
+      draw->pacing_trace =
+         debug_get_bool_option("MESA_DRI3_PRESENT_TRACE", false);
    }
 
    if (!draw->adaptive_sync)
@@ -686,6 +832,10 @@ loader_dri3_drawable_init(xcb_connection_t *conn,
    }
 
    draw->screen = get_screen_for_root(draw->conn, reply->root);
+   if (draw->present_mode != LOADER_DRI3_PRESENT_UNPACED &&
+       draw->type == LOADER_DRI3_DRAWABLE_WINDOW)
+      draw->present_capabilities =
+         dri3_query_present_capabilities(draw->conn, draw->drawable);
    draw->width = reply->width;
    draw->height = reply->height;
    draw->depth = reply->depth;
@@ -774,6 +924,16 @@ dri3_handle_present_event(struct loader_dri3_drawable *draw,
 
          draw->ust = ce->ust;
          draw->msc = ce->msc;
+         if (draw->pacing_last_complete_ust &&
+             ce->ust > draw->pacing_last_complete_ust) {
+            uint64_t sample = ce->ust - draw->pacing_last_complete_ust;
+
+            if (sample >= 4000 && sample <= 100000)
+               draw->pacing_period_us =
+                  (draw->pacing_period_us * 7 + sample) / 8;
+         }
+         draw->pacing_last_complete_ust = ce->ust;
+         draw->pacing_complete_count++;
       } else if (ce->serial == draw->eid) {
          draw->notify_ust = ce->ust;
          draw->notify_msc = ce->msc;
@@ -827,6 +987,69 @@ dri3_wait_for_event_locked(struct loader_dri3_drawable *draw,
    draw->last_special_event_sequence = ev->full_sequence;
    if (full_sequence)
       *full_sequence = ev->full_sequence;
+   ge = (void *) ev;
+   return dri3_handle_present_event(draw, ge);
+}
+
+/* Bounded variant used only by the opt-in pacer.  A stale Android timing
+ * source must not leave an application blocked forever.  Synchronization and
+ * ownership for already-submitted frames remain unchanged on timeout. */
+static bool
+dri3_wait_for_event_locked_timeout(struct loader_dri3_drawable *draw,
+                                   int timeout_ms)
+{
+   xcb_generic_event_t *ev = NULL;
+   xcb_present_generic_event_t *ge;
+   int64_t deadline_ns = os_time_get_nano() + timeout_ms * 1000000LL;
+
+   xcb_flush(draw->conn);
+
+   if (draw->has_event_waiter) {
+      struct timespec abs;
+
+      timespec_get(&abs, TIME_UTC);
+      abs.tv_sec += timeout_ms / 1000;
+      abs.tv_nsec += (timeout_ms % 1000) * 1000000L;
+      if (abs.tv_nsec >= 1000000000L) {
+         abs.tv_sec++;
+         abs.tv_nsec -= 1000000000L;
+      }
+
+      return cnd_timedwait(&draw->event_cnd, &draw->mtx, &abs) !=
+             thrd_timedout;
+   }
+
+   draw->has_event_waiter = true;
+   mtx_unlock(&draw->mtx);
+
+   while (!(ev = xcb_poll_for_special_event(draw->conn,
+                                             draw->special_event))) {
+      int64_t remaining_ns = deadline_ns - os_time_get_nano();
+      struct pollfd pfd = {
+         .fd = xcb_get_file_descriptor(draw->conn),
+         .events = POLLIN,
+      };
+      int ret;
+
+      if (remaining_ns <= 0)
+         break;
+
+      do {
+         ret = poll(&pfd, 1, DIV_ROUND_UP(remaining_ns, 1000000));
+      } while (ret < 0 && errno == EINTR);
+
+      if (ret <= 0 || (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)))
+         break;
+   }
+
+   mtx_lock(&draw->mtx);
+   draw->has_event_waiter = false;
+   cnd_broadcast(&draw->event_cnd);
+
+   if (!ev)
+      return false;
+
+   draw->last_special_event_sequence = ev->full_sequence;
    ge = (void *) ev;
    return dri3_handle_present_event(draw, ge);
 }
@@ -1249,6 +1472,7 @@ loader_dri3_swap_buffers_msc(struct loader_dri3_drawable *draw,
    struct loader_dri3_buffer *back;
    int64_t ret = 0;
    int render_fence_fd = -1;
+   bool paced_present = false;
    bool wait_for_next_buffer = false;
 
    /* GLX spec:
@@ -1278,6 +1502,15 @@ loader_dri3_swap_buffers_msc(struct loader_dri3_drawable *draw,
     */
    if (!draw->have_back || draw->type == LOADER_DRI3_DRAWABLE_PIXMAP)
       return ret;
+
+   if (dri3_present_sync_faulted(draw)) {
+      mesa_loge("DRI3: rejecting swap after producer-fence failure");
+      return ret;
+   }
+
+   paced_present = draw->swap_interval == 0 && target_msc == 0 &&
+                   divisor == 0 && remainder == 0 && !force_copy &&
+                   dri3_pacing_supported(draw);
 
    if (draw->type == LOADER_DRI3_DRAWABLE_WINDOW &&
        draw->present_sync &&
@@ -1363,13 +1596,19 @@ loader_dri3_swap_buffers_msc(struct loader_dri3_drawable *draw,
           * think all these present requests are outdated and just show the
           * Nth request at the next vblank. [1 .. N-1] requests are skipped.
           */
-         if (draw->swap_interval != 0) {
+         if (paced_present) {
+            uint64_t outstanding = draw->send_sbc - draw->recv_sbc;
+
+            target_msc = draw->msc + outstanding + 1;
+         } else if (draw->swap_interval != 0) {
             while (draw->recv_sbc != draw->send_sbc) {
                if (!dri3_wait_for_event_locked(draw, NULL))
                   break;
             }
+            target_msc = draw->msc + abs(draw->swap_interval);
+         } else {
+            target_msc = draw->msc;
          }
-         target_msc = draw->msc + abs(draw->swap_interval);
       } else if (divisor == 0 && remainder > 0) {
          /* From the GLX_OML_sync_control spec:
           *     "If <divisor> = 0, the swap will occur when MSC becomes
@@ -1403,7 +1642,7 @@ loader_dri3_swap_buffers_msc(struct loader_dri3_drawable *draw,
        * the default.
        */
       uint32_t options = XCB_PRESENT_OPTION_NONE;
-      if (draw->swap_interval <= 0)
+      if (draw->swap_interval <= 0 && !paced_present)
          options |= XCB_PRESENT_OPTION_ASYNC;
 
       /* If we need to populate the new back, but need to reuse the back
@@ -1416,11 +1655,18 @@ loader_dri3_swap_buffers_msc(struct loader_dri3_drawable *draw,
       if (draw->multiplanes_available)
          options |= XCB_PRESENT_OPTION_SUBOPTIMAL;
 
-      back->busy = 1;
-      back->last_swap = draw->send_sbc;
-
       xcb_sync_fence_t wait_fence =
          dri3_queue_present_wait_fence(draw, back, render_fence_fd);
+
+      if (wait_fence == DRI3_PRESENT_WAIT_FENCE_FAILED) {
+         draw->send_sbc--;
+         mtx_unlock(&draw->mtx);
+         dri_invalidate_drawable(draw->dri_drawable);
+         return ret;
+      }
+
+      back->busy = 1;
+      back->last_swap = draw->send_sbc;
 
       xcb_xfixes_region_t region = 0;
 
@@ -1489,6 +1735,33 @@ loader_dri3_swap_buffers_msc(struct loader_dri3_drawable *draw,
    }
 
    xcb_flush(draw->conn);
+
+   if (paced_present && draw->send_sbc - draw->recv_sbc >= 2) {
+      uint64_t wait_start_us = os_time_get();
+      int timeout_ms = MAX2((int) DIV_ROUND_UP(draw->pacing_period_us * 3,
+                                               1000),
+                            100);
+      uint64_t wait_deadline_us = wait_start_us + timeout_ms * 1000ULL;
+
+      draw->pacing_wait_count++;
+      while (draw->send_sbc - draw->recv_sbc >= 2) {
+         int64_t remaining_us = wait_deadline_us - os_time_get();
+         int remaining_ms = remaining_us > 0 ?
+            DIV_ROUND_UP(remaining_us, 1000) : 0;
+
+         if (!remaining_ms ||
+             !dri3_wait_for_event_locked_timeout(draw, remaining_ms)) {
+            draw->pacing_timeout_count++;
+            draw->pacing_timed_out = true;
+            mesa_loge("DRI3: paced Present feedback stale for %d ms; "
+                      "falling back to synchronized unpaced presentation",
+                      timeout_ms);
+            break;
+         }
+      }
+      draw->pacing_wait_us += os_time_get() - wait_start_us;
+   }
+
    if (draw->stamp)
       ++(*draw->stamp);
 

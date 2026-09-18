@@ -67,7 +67,7 @@ struct loader_dri3_buffer {
 
    uint32_t     sync_fence;     /* XID of X SyncFence object */
    uint32_t     present_wait_fence; /* GPU completion fence for Present */
-   int          present_wait_fence_triggered;
+   int          present_wait_fence_status;
    struct util_queue_fence present_wait_job;
    struct xshmfence *shm_fence; /* pointer to xshmfence object */
    bool         busy;           /* Set on swap, cleared on IdleNotify */
@@ -100,6 +100,12 @@ loader_dri3_pixmap_buf_id(enum loader_dri3_buffer_type buffer_type)
 
 struct loader_dri3_drawable;
 struct loader_dri3_present_sync;
+
+enum loader_dri3_present_mode {
+   LOADER_DRI3_PRESENT_UNPACED,
+   LOADER_DRI3_PRESENT_AUTO,
+   LOADER_DRI3_PRESENT_PACED,
+};
 
 struct loader_dri3_vtable {
    void (*set_drawable_size)(struct loader_dri3_drawable *, int, int);
@@ -176,7 +182,17 @@ struct loader_dri3_drawable {
    bool block_on_depleted_buffers;
    bool queries_buffer_age;
    bool present_sync_checked;
+   bool pacing_timed_out;
+   bool pacing_trace;
    int swap_interval;
+   enum loader_dri3_present_mode present_mode;
+   uint32_t present_capabilities;
+   uint64_t pacing_wait_count;
+   uint64_t pacing_wait_us;
+   uint64_t pacing_timeout_count;
+   uint64_t pacing_complete_count;
+   uint64_t pacing_last_complete_ust;
+   uint64_t pacing_period_us;
 
    struct loader_dri3_present_sync *present_sync;
 
