@@ -215,6 +215,17 @@ loader_dri3_pacer_note_producer_ready(struct loader_dri3_pacer *pacer,
       pacer_add_sample(pacer->production_us, &pacer->production_head,
                        &pacer->production_count,
                        now_us - frame->admitted_us);
+
+   /* Completed-candidate residence ends at backend submission.  When the
+    * dependency becomes ready only after submission, the frame never resided
+    * in the completed-but-uncommitted state and contributes a zero sample. */
+   if (frame->submitted && !frame->residence_sampled) {
+      pacer_add_sample(pacer->ready_residence_us, &pacer->residence_head,
+                       &pacer->residence_count,
+                       frame->submitted_us >= now_us ?
+                          frame->submitted_us - now_us : 0);
+      frame->residence_sampled = true;
+   }
 }
 
 void
@@ -231,10 +242,13 @@ loader_dri3_pacer_note_submitted(struct loader_dri3_pacer *pacer,
    pacer->outstanding_frames++;
    pacer->retained_allocations++;
    pacer->stats.submitted++;
-   if (frame->producer_ready && now_us >= frame->producer_ready_us)
+   if (frame->producer_ready && !frame->residence_sampled) {
       pacer_add_sample(pacer->ready_residence_us, &pacer->residence_head,
                        &pacer->residence_count,
-                       now_us - frame->producer_ready_us);
+                       now_us >= frame->producer_ready_us ?
+                          now_us - frame->producer_ready_us : 0);
+      frame->residence_sampled = true;
+   }
    pacer_observe(pacer, LOADER_DRI3_PACER_BLOCK_COMMITMENT, now_us);
 }
 

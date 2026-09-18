@@ -36,6 +36,7 @@ struct loader_dri3_pacer_frame {
    bool reserved;
    bool producer_ready;
    bool submitted;
+   bool residence_sampled;
    bool completed;
    bool storage_released;
    bool cancelled;

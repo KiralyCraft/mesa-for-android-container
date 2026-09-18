@@ -72,6 +72,37 @@ test_production_and_submission_credits_are_independent(void)
 }
 
 static void
+test_ready_residence_covers_both_event_orders(void)
+{
+   struct loader_dri3_pacer pacer;
+
+   loader_dri3_pacer_init(&pacer, 1000);
+
+   assert(loader_dri3_pacer_reserve(&pacer, 1, 11, 1000, 1000));
+   loader_dri3_pacer_note_producer_ready(&pacer, 1, 1200);
+   loader_dri3_pacer_note_submitted(&pacer, 1, 1500);
+   assert(pacer.residence_count == 1);
+   assert(pacer.ready_residence_us[0] == 300);
+   assert(pacer.frames[0].residence_sampled);
+   loader_dri3_pacer_note_complete(&pacer, 1, 10000, 11, 1600);
+   loader_dri3_pacer_note_storage_released(&pacer, 1, 1700);
+
+   assert(loader_dri3_pacer_reserve(&pacer, 2, 12, 1800, 1800));
+   loader_dri3_pacer_note_submitted(&pacer, 2, 1900);
+   assert(pacer.residence_count == 1);
+   loader_dri3_pacer_note_producer_ready(&pacer, 2, 2200);
+   assert(pacer.residence_count == 2);
+   assert(pacer.ready_residence_us[1] == 0);
+   assert(pacer.frames[0].serial == 2);
+   assert(pacer.frames[0].residence_sampled);
+
+   /* Repeated notifications must not contribute duplicate samples. */
+   loader_dri3_pacer_note_producer_ready(&pacer, 2, 2300);
+   loader_dri3_pacer_note_submitted(&pacer, 2, 2300);
+   assert(pacer.residence_count == 2);
+}
+
+static void
 test_production_history_and_deadline(void)
 {
    struct loader_dri3_pacer pacer;
@@ -213,6 +244,7 @@ main(void)
 {
    test_independent_lifetimes();
    test_production_and_submission_credits_are_independent();
+   test_ready_residence_covers_both_event_orders();
    test_production_history_and_deadline();
    test_timeout_and_recovery();
    test_generation_reset_and_cancel();
