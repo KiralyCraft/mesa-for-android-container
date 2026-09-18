@@ -12,6 +12,8 @@
 #include "util/u_math.h"
 
 DEBUG_GET_ONCE_BOOL_OPTION(autotune_log, "FD_AUTOTUNE_LOG", false)
+/* DEBUG: opt-in measured-mode training; never enabled by default. */
+DEBUG_GET_ONCE_BOOL_OPTION(autotune_measured, "FD_AUTOTUNE_MEASURED", false)
 
 /**
  * Tracks, for a given batch key (which maps to a FBO/framebuffer state),
@@ -35,8 +37,8 @@ struct fd_batch_history {
 
 /*
  * An address-independent description of work whose GMEM and SYSMEM timings
- * may be compared.  This is observation-only for now: the existing batch-key
- * history and samples-passed policy remain authoritative.
+ * may be compared.  The existing batch-key history and samples-passed policy
+ * remain authoritative unless measured-mode training is explicitly enabled.
  *
  * Keep this as an explicitly versioned, zero-initialized fixed layout so that
  * compiler padding cannot make otherwise identical passes hash differently.
@@ -44,14 +46,21 @@ struct fd_batch_history {
 #define FD_AUTOTUNE_SIGNATURE_VERSION 2
 
 #define MAX_TIMING_HISTORIES       64
-#define MAX_TIMING_RESULTS         16
-#define MIN_COMPARE_RESULTS        8
+#define MAX_TIMING_RESULTS         32
+#define MIN_COMPARE_RESULTS        32
 #define TIMING_IMPROVEMENT_PERCENT 5
 
 enum fd_autotune_timing_mode {
    FD_AUTOTUNE_TIMING_GMEM,
    FD_AUTOTUNE_TIMING_SYSMEM,
    FD_AUTOTUNE_TIMING_MODE_COUNT,
+};
+
+enum fd_autotune_timing_candidate {
+   FD_AUTOTUNE_CANDIDATE_INSUFFICIENT,
+   FD_AUTOTUNE_CANDIDATE_INCONCLUSIVE,
+   FD_AUTOTUNE_CANDIDATE_GMEM,
+   FD_AUTOTUNE_CANDIDATE_SYSMEM,
 };
 
 struct fd_autotune_mode_timings {
@@ -68,17 +77,22 @@ struct fd_autotune_mode_timings {
  * rotating presentation buffers may have different address-based batch keys
  * while still representing the same work.
  *
- * This history reports a candidate only for validation.  The legacy
- * samples-passed heuristic remains the sole selection policy.
+ * The legacy samples-passed heuristic remains the sole default policy.  The
+ * DEBUG measured-mode option uses this history only when explicitly enabled.
  */
 struct fd_autotune_timing_history {
    uint64_t structural_signature;
    struct list_head node;
    struct fd_autotune_mode_timings mode[FD_AUTOTUNE_TIMING_MODE_COUNT];
+   uint64_t training_scheduled[FD_AUTOTUNE_TIMING_MODE_COUNT];
+   enum fd_autotune_timing_candidate locked_candidate;
+   bool candidate_locked;
+   bool training_complete;
 };
 
 static void
-log_timing_history(const struct fd_autotune_timing_history *history);
+log_timing_history(const struct fd_autotune *at,
+                   const struct fd_autotune_timing_history *history);
 
 struct fd_autotune_attachment_signature {
    uint32_t pitch;
@@ -259,7 +273,7 @@ get_timing_history(struct fd_autotune *at, uint64_t signature)
          &at->timing_lru, struct fd_autotune_timing_history, node);
 
       if (unlikely(at->log))
-         log_timing_history(last);
+         log_timing_history(at, last);
 
       _mesa_hash_table_u64_remove(at->timing_ht, last->structural_signature);
       list_del(&last->node);
@@ -335,30 +349,61 @@ summarize_timings(const struct fd_autotune_mode_timings *timings)
    };
 }
 
-static const char *
+static enum fd_autotune_timing_candidate
 timing_candidate(const struct fd_autotune_timing_history *history,
                  const struct fd_autotune_timing_summary *gmem,
                  const struct fd_autotune_timing_summary *sysmem)
 {
    if (history->mode[FD_AUTOTUNE_TIMING_GMEM].count < MIN_COMPARE_RESULTS ||
        history->mode[FD_AUTOTUNE_TIMING_SYSMEM].count < MIN_COMPARE_RESULTS)
-      return "insufficient";
+      return FD_AUTOTUNE_CANDIDATE_INSUFFICIENT;
 
    const double threshold = (100.0 - TIMING_IMPROVEMENT_PERCENT) / 100.0;
 
    if (gmem->mean_ns <= sysmem->mean_ns * threshold &&
        gmem->p95_ns <= sysmem->p95_ns * threshold)
-      return "gmem";
+      return FD_AUTOTUNE_CANDIDATE_GMEM;
 
    if (sysmem->mean_ns <= gmem->mean_ns * threshold &&
        sysmem->p95_ns <= gmem->p95_ns * threshold)
-      return "sysmem";
+      return FD_AUTOTUNE_CANDIDATE_SYSMEM;
 
-   return "inconclusive";
+   return FD_AUTOTUNE_CANDIDATE_INCONCLUSIVE;
+}
+
+static const char *
+timing_candidate_name(enum fd_autotune_timing_candidate candidate)
+{
+   switch (candidate) {
+   case FD_AUTOTUNE_CANDIDATE_INSUFFICIENT:
+      return "insufficient";
+   case FD_AUTOTUNE_CANDIDATE_INCONCLUSIVE:
+      return "inconclusive";
+   case FD_AUTOTUNE_CANDIDATE_GMEM:
+      return "gmem";
+   case FD_AUTOTUNE_CANDIDATE_SYSMEM:
+      return "sysmem";
+   }
+
+   return "invalid";
+}
+
+static const char *
+timing_decision_name(const struct fd_autotune_timing_history *history)
+{
+   if (history->candidate_locked)
+      return timing_candidate_name(history->locked_candidate);
+   if (history->training_complete)
+      return "legacy";
+   if (history->training_scheduled[FD_AUTOTUNE_TIMING_GMEM] ||
+       history->training_scheduled[FD_AUTOTUNE_TIMING_SYSMEM])
+      return "training";
+   return "unchanged";
 }
 
 static void
-log_timing_history(const struct fd_autotune_timing_history *history)
+log_timing_history(const struct fd_autotune *at,
+                   const struct fd_autotune_timing_history *history)
 {
    const struct fd_autotune_mode_timings *gmem_timings =
       &history->mode[FD_AUTOTUNE_TIMING_GMEM];
@@ -366,15 +411,131 @@ log_timing_history(const struct fd_autotune_timing_history *history)
       &history->mode[FD_AUTOTUNE_TIMING_SYSMEM];
    struct fd_autotune_timing_summary gmem = summarize_timings(gmem_timings);
    struct fd_autotune_timing_summary sysmem = summarize_timings(sysmem_timings);
+   enum fd_autotune_timing_candidate candidate =
+      timing_candidate(history, &gmem, &sysmem);
 
-   mesa_logi("freedreno autotune observation: signature=%016" PRIx64
-             " gmem=%u/%" PRIu64 " mean_ns=%" PRIu64 " p95_ns=%" PRIu64
-             " sysmem=%u/%" PRIu64 " mean_ns=%" PRIu64 " p95_ns=%" PRIu64
-             " candidate=%s policy=unchanged",
-             history->structural_signature, gmem_timings->count,
-             gmem_timings->total_seen, gmem.mean_ns, gmem.p95_ns,
-             sysmem_timings->count, sysmem_timings->total_seen, sysmem.mean_ns,
-             sysmem.p95_ns, timing_candidate(history, &gmem, &sysmem));
+   mesa_logi(
+      "freedreno autotune observation: signature=%016" PRIx64
+      " gmem=%u/%" PRIu64 " mean_ns=%" PRIu64 " p95_ns=%" PRIu64
+      " sysmem=%u/%" PRIu64 " mean_ns=%" PRIu64 " p95_ns=%" PRIu64
+      " training_scheduled=%" PRIu64 "/%" PRIu64
+      " candidate=%s decision=%s policy=%s",
+      history->structural_signature, gmem_timings->count,
+      gmem_timings->total_seen, gmem.mean_ns, gmem.p95_ns,
+      sysmem_timings->count, sysmem_timings->total_seen, sysmem.mean_ns,
+      sysmem.p95_ns, history->training_scheduled[FD_AUTOTUNE_TIMING_GMEM],
+      history->training_scheduled[FD_AUTOTUNE_TIMING_SYSMEM],
+      timing_candidate_name(candidate), timing_decision_name(history),
+      (at->measured && (history->training_scheduled[FD_AUTOTUNE_TIMING_GMEM] ||
+                        history->training_scheduled[FD_AUTOTUNE_TIMING_SYSMEM]))
+         ? "measured"
+         : "unchanged");
+}
+
+static bool
+schedule_measured_mode(struct fd_autotune_timing_history *history,
+                       bool use_bypass)
+{
+   enum fd_autotune_timing_mode mode =
+      use_bypass ? FD_AUTOTUNE_TIMING_SYSMEM : FD_AUTOTUNE_TIMING_GMEM;
+
+   history->training_scheduled[mode]++;
+   return use_bypass;
+}
+
+/* DEBUG: bounded measured-mode training for validation only. */
+static bool
+measured_mode_eligible(const struct fd_batch *batch)
+{
+   const struct pipe_framebuffer_state *pfb = &batch->framebuffer;
+
+   if (FD_DBG(GMEM) || FD_DBG(SYSMEM) || batch->tessellation)
+      return false;
+
+   if (!pfb->nr_cbufs && !pfb->zsbuf.texture)
+      return false;
+
+   for (unsigned i = 0; i < pfb->nr_cbufs; i++) {
+      const struct pipe_surface *surface = &pfb->cbufs[i];
+
+      if (surface->texture && surface->first_layer < surface->last_layer)
+         return false;
+   }
+
+   if (pfb->zsbuf.texture && pfb->zsbuf.first_layer < pfb->zsbuf.last_layer)
+      return false;
+
+   return true;
+}
+
+static bool
+measured_use_bypass(struct fd_autotune *at, struct fd_batch *batch,
+                    bool legacy_use_bypass)
+{
+   if (!at->measured || !measured_mode_eligible(batch))
+      return legacy_use_bypass;
+
+   struct fd_autotune_timing_history *history =
+      get_timing_history(at, batch->autotune_result->structural_signature);
+   if (!history)
+      return legacy_use_bypass;
+
+   const struct fd_autotune_mode_timings *gmem =
+      &history->mode[FD_AUTOTUNE_TIMING_GMEM];
+   const struct fd_autotune_mode_timings *sysmem =
+      &history->mode[FD_AUTOTUNE_TIMING_SYSMEM];
+
+   if (history->candidate_locked) {
+      return history->locked_candidate == FD_AUTOTUNE_CANDIDATE_SYSMEM;
+   }
+   if (history->training_complete)
+      return legacy_use_bypass;
+
+   /* Sample successive occurrences once each.  A tie retains the legacy
+    * choice, and the scheduled count tips the following occurrence to the
+    * other mode even while results are still pending.  The live batch is
+    * never executed twice.
+    */
+   if (gmem->count < MIN_COMPARE_RESULTS ||
+       sysmem->count < MIN_COMPARE_RESULTS) {
+      if (history->training_scheduled[FD_AUTOTUNE_TIMING_GMEM] <
+          history->training_scheduled[FD_AUTOTUNE_TIMING_SYSMEM])
+         return schedule_measured_mode(history, false);
+      if (history->training_scheduled[FD_AUTOTUNE_TIMING_SYSMEM] <
+          history->training_scheduled[FD_AUTOTUNE_TIMING_GMEM])
+         return schedule_measured_mode(history, true);
+      return schedule_measured_mode(history, legacy_use_bypass);
+   }
+
+   struct fd_autotune_timing_summary gmem_summary = summarize_timings(gmem);
+   struct fd_autotune_timing_summary sysmem_summary = summarize_timings(sysmem);
+   enum fd_autotune_timing_candidate candidate =
+      timing_candidate(history, &gmem_summary, &sysmem_summary);
+
+   if (candidate == FD_AUTOTUNE_CANDIDATE_GMEM ||
+       candidate == FD_AUTOTUNE_CANDIDATE_SYSMEM) {
+      history->locked_candidate = candidate;
+      history->candidate_locked = true;
+
+      return candidate == FD_AUTOTUNE_CANDIDATE_SYSMEM;
+   }
+
+   /* Give an inconclusive signature a full small window in each mode, then
+    * retain the established heuristic rather than exploring indefinitely.
+    */
+   if (gmem->total_seen < MAX_TIMING_RESULTS ||
+       sysmem->total_seen < MAX_TIMING_RESULTS) {
+      if (history->training_scheduled[FD_AUTOTUNE_TIMING_GMEM] <
+          history->training_scheduled[FD_AUTOTUNE_TIMING_SYSMEM])
+         return schedule_measured_mode(history, false);
+      if (history->training_scheduled[FD_AUTOTUNE_TIMING_SYSMEM] <
+          history->training_scheduled[FD_AUTOTUNE_TIMING_GMEM])
+         return schedule_measured_mode(history, true);
+      return schedule_measured_mode(history, legacy_use_bypass);
+   }
+
+   history->training_complete = true;
+   return legacy_use_bypass;
 }
 
 static struct fd_batch_history *
@@ -510,9 +671,10 @@ process_results(struct fd_autotune *at)
          result->duration_ns = at->ts_to_ns(end - start);
       }
 
-      if (unlikely(at->log)) {
+      if (unlikely(at->timing_ht))
          record_timing_result(at, result);
 
+      if (unlikely(at->log)) {
          mesa_logi("freedreno autotune: key=%08x signature=%016" PRIx64
                    " draws=%u mode=%s "
                    "samples=%" PRIu64 " duration_ns=%" PRIu64,
@@ -598,10 +760,7 @@ fd_autotune_use_bypass(struct fd_autotune *at, struct fd_batch *batch)
 
    bool use_bypass = fallback_use_bypass(batch);
 
-   if (use_bypass)
-      return true;
-
-   if (history->num_results > 0) {
+   if (!use_bypass && history->num_results > 0) {
       uint32_t total_samples = 0;
 
       // TODO we should account for clears somehow
@@ -617,26 +776,27 @@ fd_autotune_use_bypass(struct fd_autotune *at, struct fd_batch *batch)
       /* Low sample count could mean there was only a clear.. or there was
        * a clear plus draws that touch no or few samples
        */
-      if (avg_samples < 500.0f)
-         return true;
+      if (avg_samples < 500.0f) {
+         use_bypass = true;
+      } else {
+         /* Cost-per-sample is an estimate for the average number of reads+
+          * writes for a given passed sample.
+          */
+         float sample_cost = batch->cost;
+         sample_cost /= batch->num_draws;
 
-      /* Cost-per-sample is an estimate for the average number of reads+
-       * writes for a given passed sample.
-       */
-      float sample_cost = batch->cost;
-      sample_cost /= batch->num_draws;
+         float total_draw_cost = (avg_samples * sample_cost) / batch->num_draws;
+         DBG("%08x:%u\ttotal_samples=%u, avg_samples=%f, sample_cost=%f, "
+             "total_draw_cost=%f\n",
+             batch->hash, batch->num_draws, total_samples, avg_samples,
+             sample_cost, total_draw_cost);
 
-      float total_draw_cost = (avg_samples * sample_cost) / batch->num_draws;
-      DBG("%08x:%u\ttotal_samples=%u, avg_samples=%f, sample_cost=%f, "
-          "total_draw_cost=%f\n",
-          batch->hash, batch->num_draws, total_samples, avg_samples,
-          sample_cost, total_draw_cost);
-
-      if (total_draw_cost < 3000.0f)
-         return true;
+         if (total_draw_cost < 3000.0f)
+            use_bypass = true;
+      }
    }
 
-   return use_bypass;
+   return measured_use_bypass(at, batch, use_bypass);
 }
 
 void
@@ -669,10 +829,18 @@ fd_autotune_init(struct fd_autotune *at, struct fd_context *ctx)
    list_inithead(&at->lru);
 
    at->log = debug_get_option_autotune_log();
+   bool measured_requested = debug_get_option_autotune_measured();
+   at->measured = measured_requested && ctx->record_timestamp && ctx->ts_to_ns;
 
    /* DEBUG: do not allocate or update observation history in normal runs. */
-   at->timing_ht = at->log ? _mesa_hash_table_u64_create(NULL) : NULL;
+   at->timing_ht =
+      (at->log || at->measured) ? _mesa_hash_table_u64_create(NULL) : NULL;
    list_inithead(&at->timing_lru);
+
+   if (at->measured && !at->timing_ht) {
+      mesa_logw("freedreno autotune: measured history allocation failed");
+      at->measured = false;
+   }
 
    at->results_mem = fd_bo_new(
       ctx->screen->dev, sizeof(struct fd_autotune_results), 0, "autotune");
@@ -682,6 +850,10 @@ fd_autotune_init(struct fd_autotune *at, struct fd_context *ctx)
 
    if (at->log)
       mesa_logi("freedreno autotune: whole-pass timing log enabled");
+   if (at->measured)
+      mesa_logi("freedreno autotune: DEBUG measured-mode training enabled");
+   else if (measured_requested)
+      mesa_logw("freedreno autotune: measured mode requires GPU timestamps");
 
    list_inithead(&at->pending_results);
 }
@@ -691,7 +863,7 @@ fd_autotune_fini(struct fd_autotune *at)
 {
    if (unlikely(at->log) && at->timing_ht) {
       hash_table_u64_foreach (at->timing_ht, entry) {
-         log_timing_history(entry.data);
+         log_timing_history(at, entry.data);
       }
    }
 
