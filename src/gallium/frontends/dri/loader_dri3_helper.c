@@ -1060,7 +1060,7 @@ dri3_handle_present_event(struct loader_dri3_drawable *draw,
       if (ce->kind == LORIE_PRESENT_COMPLETE_KIND_ACTUAL) {
          if ((draw->present_capabilities &
               LORIE_PRESENT_CAP_ACTUAL_FEEDBACK) &&
-             ce->eid == draw->eid &&
+             ce->event == draw->eid &&
              (ce->mode == LORIE_PRESENT_COMPLETE_MODE_ACTUAL ||
               ce->mode == LORIE_PRESENT_COMPLETE_MODE_UNKNOWN)) {
             loader_dri3_pacer_note_actual(
