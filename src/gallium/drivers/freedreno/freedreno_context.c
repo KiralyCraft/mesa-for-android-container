@@ -774,7 +774,7 @@ fd_context_init(struct fd_context *ctx, struct pipe_screen *pscreen,
                              NULL,
                              fd_trace_delete_flush_data);
 
-   fd_autotune_init(&ctx->autotune, screen->dev);
+   fd_autotune_init(&ctx->autotune, ctx);
 
    if (!(ctx->flags & FD_CONTEXT_FLAG_AUX))
       p_atomic_inc(&pctx->screen->num_contexts);

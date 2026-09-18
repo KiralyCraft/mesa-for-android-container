@@ -5,7 +5,10 @@
 
 #include "freedreno_autotune.h"
 #include "freedreno_batch.h"
+#include "freedreno_context.h"
 #include "freedreno_util.h"
+
+DEBUG_GET_ONCE_BOOL_OPTION(autotune_log, "FD_AUTOTUNE_LOG", false)
 
 /**
  * Tracks, for a given batch key (which maps to a FBO/framebuffer state),
@@ -78,6 +81,9 @@ result_destructor(void *r)
 {
    struct fd_batch_result *result = r;
 
+   if (result->pending)
+      result->at->num_pending--;
+
    /* Just in case we manage to somehow still be on the pending_results list: */
    list_del(&result->node);
 }
@@ -85,14 +91,28 @@ result_destructor(void *r)
 static struct fd_batch_result *
 get_result(struct fd_autotune *at, struct fd_batch_history *history)
 {
+   if (at->num_pending >= ARRAY_SIZE(at->results->result))
+      return NULL;
+
    struct fd_batch_result *result = rzalloc_size(history, sizeof(*result));
+   if (!result)
+      return NULL;
 
    result->fence =
       ++at->fence_counter; /* pre-increment so zero isn't valid fence */
    result->idx = at->idx_counter++;
+   result->at = at;
+   result->pending = true;
+   at->num_pending++;
 
    if (at->idx_counter >= ARRAY_SIZE(at->results->result))
       at->idx_counter = 0;
+
+   /* This field is also the KGSL completion token.  Reset it before the
+    * slot is submitted so stale data from an earlier use cannot make a new
+    * result appear ready.
+    */
+   p_atomic_set(&at->results->result[result->idx].timestamp_end, UINT64_MAX);
 
    result->history = history;
    list_addtail(&result->node, &at->pending_results);
@@ -105,18 +125,54 @@ get_result(struct fd_autotune *at, struct fd_batch_history *history)
 static void
 process_results(struct fd_autotune *at)
 {
-   uint32_t current_fence = at->results->fence;
+   uint32_t current_fence = p_atomic_read(&at->results->fence);
 
    list_for_each_entry_safe (struct fd_batch_result, result,
                              &at->pending_results, node) {
-      if (result->fence > current_fence)
+      uint64_t timestamp_end = UINT64_MAX;
+
+      /* The CACHE_CLEAN user fence used by the DRM path does not update the
+       * mapped results BO on KGSL.  The preceding RB_DONE timestamp does, so
+       * use that write as the asynchronous completion token there.  It also
+       * carries the whole-pass end time we want to measure.
+       */
+      if (at->use_timestamp_completion && result->timestamped) {
+         timestamp_end =
+            p_atomic_read(&at->results->result[result->idx].timestamp_end);
+         if (timestamp_end == UINT64_MAX)
+            break;
+      } else if (result->fence > current_fence) {
          break;
+      }
 
       struct fd_batch_history *history = result->history;
 
       result->samples_passed = at->results->result[result->idx].samples_end -
                                at->results->result[result->idx].samples_start;
 
+      if (result->timestamped) {
+         uint64_t start =
+            p_atomic_read(&at->results->result[result->idx].timestamp_start);
+         uint64_t end = timestamp_end;
+
+         if (!at->use_timestamp_completion) {
+            end =
+               p_atomic_read(&at->results->result[result->idx].timestamp_end);
+         }
+
+         result->duration_ns = at->ts_to_ns(end - start);
+      }
+
+      if (unlikely(at->log)) {
+         mesa_logi("freedreno autotune: key=%08x draws=%u mode=%s "
+                   "samples=%" PRIu64 " duration_ns=%" PRIu64,
+                   result->batch_hash, result->num_draws,
+                   result->use_bypass ? "sysmem" : "gmem",
+                   result->samples_passed, result->duration_ns);
+      }
+
+      result->pending = false;
+      at->num_pending--;
       list_delinit(&result->node);
       list_add(&result->node, &history->results);
 
@@ -182,7 +238,12 @@ fd_autotune_use_bypass(struct fd_autotune *at, struct fd_batch *batch)
       return fallback_use_bypass(batch);
 
    batch->autotune_result = get_result(at, history);
+   if (!batch->autotune_result)
+      return fallback_use_bypass(batch);
+
    batch->autotune_result->cost = batch->cost;
+   batch->autotune_result->batch_hash = batch->hash;
+   batch->autotune_result->num_draws = batch->num_draws;
 
    bool use_bypass = fallback_use_bypass(batch);
 
@@ -228,15 +289,43 @@ fd_autotune_use_bypass(struct fd_autotune *at, struct fd_batch *batch)
 }
 
 void
-fd_autotune_init(struct fd_autotune *at, struct fd_device *dev)
+fd_autotune_begin(struct fd_autotune *at, struct fd_batch *batch,
+                  bool use_bypass)
 {
+   struct fd_batch_result *result = batch->autotune_result;
+   struct fd_context *ctx = batch->ctx;
+
+   if (!result)
+      return;
+
+   result->use_bypass = use_bypass;
+   result->timestamped = ctx->record_timestamp && at->ts_to_ns;
+
+   if (!result->timestamped)
+      return;
+
+   ctx->record_timestamp(batch->gmem,
+                         results_ptr(at, result[result->idx].timestamp_start));
+}
+
+void
+fd_autotune_init(struct fd_autotune *at, struct fd_context *ctx)
+{
+   STATIC_ASSERT(sizeof(struct fd_autotune_results) == 4096);
+
    at->ht =
       _mesa_hash_table_create(NULL, fd_batch_key_hash, fd_batch_key_equals);
    list_inithead(&at->lru);
 
-   at->results_mem = fd_bo_new(dev, sizeof(struct fd_autotune_results),
-                               0, "autotune");
+   at->results_mem = fd_bo_new(
+      ctx->screen->dev, sizeof(struct fd_autotune_results), 0, "autotune");
    at->results = fd_bo_map(at->results_mem);
+   at->ts_to_ns = ctx->ts_to_ns;
+   at->log = debug_get_option_autotune_log();
+   at->use_timestamp_completion = ctx->screen->is_kgsl;
+
+   if (at->log)
+      mesa_logi("freedreno autotune: whole-pass timing log enabled");
 
    list_inithead(&at->pending_results);
 }

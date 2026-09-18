@@ -857,6 +857,11 @@ emit_common_fini(fd_cs &cs, struct fd_batch *batch)
          ));
    }
 
+   if (result->timestamped) {
+      fd6_record_ts<CHIP>(cs,
+                          results_ptr(at, result[result->idx].timestamp_end));
+   }
+
    fd6_fence_write<CHIP>(cs, result->fence, results_ptr(at, fence));
 }
 

@@ -11,7 +11,12 @@
 
 #include "freedreno_util.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 struct fd_autotune_results;
+struct fd_context;
 
 /**
  * "autotune" our decisions about bypass vs GMEM rendering, based on historical
@@ -78,13 +83,18 @@ struct fd_autotune {
 
    uint32_t fence_counter;
    uint32_t idx_counter;
+   uint32_t num_pending;
+   bool log;
+   bool use_timestamp_completion;
+
+   uint64_t (*ts_to_ns)(uint64_t ts);
 };
 
 /**
  * The layout of the memory used to read back per-batch results from the
  * GPU
  *
- * Note this struct is intentionally aligned to 4k.  And hw requires the
+ * Note this struct is intentionally sized to 4k.  And hw requires the
  * sample start/stop locations to be 128b aligned.
  */
 struct fd_autotune_results {
@@ -111,7 +121,9 @@ struct fd_autotune_results {
       uint64_t samples_result;
       uint64_t samples_end;
       uint64_t __pad1;
-   } result[127];
+      uint64_t timestamp_start;
+      uint64_t timestamp_end;
+   } result[85];
 };
 
 #define __offset(base, ptr) ((uint8_t *)(ptr) - (uint8_t *)(base))
@@ -145,16 +157,29 @@ struct fd_batch_result {
     * Below here, only used internally within autotune
     */
    struct fd_batch_history *history;
+   struct fd_autotune *at;
    struct list_head node;
    uint32_t cost;
+   uint32_t batch_hash;
+   uint32_t num_draws;
    uint64_t samples_passed;
+   uint64_t duration_ns;
+   bool use_bypass;
+   bool timestamped;
+   bool pending;
 };
 
-void fd_autotune_init(struct fd_autotune *at, struct fd_device *dev);
+void fd_autotune_init(struct fd_autotune *at, struct fd_context *ctx);
 void fd_autotune_fini(struct fd_autotune *at);
 
 struct fd_batch;
 bool fd_autotune_use_bypass(struct fd_autotune *at,
                             struct fd_batch *batch) assert_dt;
+void fd_autotune_begin(struct fd_autotune *at, struct fd_batch *batch,
+                       bool use_bypass) assert_dt;
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* FREEDRENO_AUTOTUNE_H */

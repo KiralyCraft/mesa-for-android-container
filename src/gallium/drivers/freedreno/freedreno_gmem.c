@@ -755,6 +755,9 @@ fd_gmem_render_tiles(struct fd_batch *batch)
 
    ctx->stats.batch_total++;
 
+   if (!batch->nondraw)
+      fd_autotune_begin(&ctx->autotune, batch, sysmem);
+
    if (batch->nondraw) {
       DBG("%p: rendering non-draw", batch);
       if (!fd_ringbuffer_empty(batch->draw)) {
