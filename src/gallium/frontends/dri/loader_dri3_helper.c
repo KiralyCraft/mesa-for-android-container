@@ -1895,6 +1895,24 @@ loader_dri3_swap_buffers_msc(struct loader_dri3_drawable *draw,
 
    dri_invalidate_drawable(draw->dri_drawable);
 
+   /* Clients that use up all available buffers usually regulate their drawing
+    * through swapchain contention backpressure. In such a scenario the client
+    * draws whenever control returns to it. Its event loop is slowed down only
+    * by us waiting on buffers becoming available again.
+    *
+    * By waiting here on a new buffer and only then returning back to the client
+    * we ensure the client begins drawing only when the next buffer is available
+    * and not draw first and then wait a refresh cycle on the next available
+    * buffer to show it. This way we can reduce the latency between what is
+    * being drawn by the client and what is shown on the screen by one frame.
+    */
+   if (wait_for_next_buffer)
+      dri3_find_back(draw, draw->prefer_back_buffer_reuse);
+
+   /* Production is admitted only after every condition which can withhold
+    * control from the application has been met.  In particular, recording
+    * admission before the writable-buffer wait would misclassify consumer
+    * retention as game/GPU production time and bias the deadline estimator. */
    if (paced_present) {
       uint64_t wait_start_us = os_time_get();
       bool waited_for_admission = admission_deadline_us > wait_start_us;
@@ -1912,20 +1930,6 @@ loader_dri3_swap_buffers_msc(struct loader_dri3_drawable *draw,
       loader_dri3_pacer_admit_next(&draw->pacer, admitted_us);
       mtx_unlock(&draw->mtx);
    }
-
-   /* Clients that use up all available buffers usually regulate their drawing
-    * through swapchain contention backpressure. In such a scenario the client
-    * draws whenever control returns to it. Its event loop is slowed down only
-    * by us waiting on buffers becoming available again.
-    *
-    * By waiting here on a new buffer and only then returning back to the client
-    * we ensure the client begins drawing only when the next buffer is available
-    * and not draw first and then wait a refresh cycle on the next available
-    * buffer to show it. This way we can reduce the latency between what is
-    * being drawn by the client and what is shown on the screen by one frame.
-    */
-   if (wait_for_next_buffer)
-      dri3_find_back(draw, draw->prefer_back_buffer_reuse);
 
    return ret;
 }
