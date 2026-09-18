@@ -152,6 +152,37 @@ test_timeout_and_recovery(void)
 }
 
 static void
+test_lost_timing_preserves_dependencies(void)
+{
+   struct loader_dri3_pacer pacer;
+   struct loader_dri3_pacer_snapshot snapshot;
+
+   loader_dri3_pacer_init(&pacer, 1000);
+   assert(loader_dri3_pacer_reserve(&pacer, 1, 10, 1000, 1000));
+   loader_dri3_pacer_note_producer_ready(&pacer, 1, 4000);
+   loader_dri3_pacer_note_submitted(&pacer, 1, 4100);
+
+   loader_dri3_pacer_timing_timeout(&pacer, 104100);
+   loader_dri3_pacer_snapshot(&pacer, 104100, &snapshot);
+   assert(snapshot.timing_timed_out);
+   assert(snapshot.outstanding_frames == 1);
+   assert(snapshot.retained_allocations == 1);
+   assert(!loader_dri3_pacer_submission_credit(&pacer));
+
+   /* A timing timeout cancels only scheduling waits.  The actual completion
+    * and consumer release remain the only events which release their credits. */
+   loader_dri3_pacer_note_complete(&pacer, 1, 166670, 10, 105000);
+   assert(loader_dri3_pacer_submission_credit(&pacer));
+   loader_dri3_pacer_snapshot(&pacer, 105000, &snapshot);
+   assert(snapshot.outstanding_frames == 0);
+   assert(snapshot.retained_allocations == 1);
+
+   loader_dri3_pacer_note_storage_released(&pacer, 1, 106000);
+   loader_dri3_pacer_snapshot(&pacer, 106000, &snapshot);
+   assert(snapshot.retained_allocations == 0);
+}
+
+static void
 test_generation_reset_and_cancel(void)
 {
    struct loader_dri3_pacer pacer;
@@ -247,6 +278,7 @@ main(void)
    test_ready_residence_covers_both_event_orders();
    test_production_history_and_deadline();
    test_timeout_and_recovery();
+   test_lost_timing_preserves_dependencies();
    test_generation_reset_and_cancel();
    test_old_generation_feedback_does_not_seed_timeline();
    test_retained_allocations_are_not_recycled();

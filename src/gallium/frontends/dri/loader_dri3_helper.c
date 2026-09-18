@@ -72,6 +72,7 @@ static struct loader_dri3_blit_context blit_context = {
 struct loader_dri3_present_sync {
    struct util_queue queue;
    int cancel_fd;
+   int fault_fd;
 };
 
 struct loader_dri3_present_job {
@@ -82,6 +83,7 @@ struct loader_dri3_present_job {
    int *fence_status;
    int fence_fd;
    int cancel_fd;
+   int fault_fd;
 };
 
 enum dri3_present_wait_status {
@@ -105,6 +107,18 @@ enum dri3_present_wait_status {
 #define DRI3_PRESENT_EVENT_POLL_SLICE_MS 2
 
 static void
+dri3_present_job_fail(struct loader_dri3_present_job *job)
+{
+   p_atomic_set(job->fence_status, DRI3_PRESENT_WAIT_FAILED);
+
+   /* Wake a paced commitment wait immediately.  Do not trigger the X fence:
+    * a timing or native-fence failure is not proof that rendering completed. */
+   if (eventfd_write(job->fault_fd, 1) && errno != EAGAIN)
+      mesa_loge("DRI3: failed to publish presentation-fence failure: %s",
+                strerror(errno));
+}
+
+static void
 dri3_present_job_execute(void *data, void *gdata, int thread_index)
 {
    struct loader_dri3_present_job *job = data;
@@ -122,20 +136,21 @@ dri3_present_job_execute(void *data, void *gdata, int thread_index)
    if (ret < 0) {
       mesa_loge("DRI3: failed to wait for presentation fence: %s",
                 strerror(errno));
-      p_atomic_set(job->fence_status, DRI3_PRESENT_WAIT_FAILED);
+      dri3_present_job_fail(job);
       return;
    }
 
    if (fds[1].revents) {
-      p_atomic_set(job->fence_status, DRI3_PRESENT_WAIT_FAILED);
+      dri3_present_job_fail(job);
       return;
    }
 
-   if (!(fds[0].revents & POLLIN)) {
+   if ((fds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) ||
+       !(fds[0].revents & POLLIN)) {
       mesa_loge("DRI3: presentation fence reported poll events 0x%x; "
                 "the Present dependency will remain unsignalled",
                 fds[0].revents);
-      p_atomic_set(job->fence_status, DRI3_PRESENT_WAIT_FAILED);
+      dri3_present_job_fail(job);
       return;
    }
 
@@ -181,6 +196,7 @@ dri3_present_sync_fini(struct loader_dri3_drawable *draw)
     * dependency while its producer can still be writing. */
    util_queue_finish(&sync->queue);
    util_queue_destroy(&sync->queue);
+   close(sync->fault_fd);
    close(sync->cancel_fd);
    free(sync);
    draw->present_sync = NULL;
@@ -227,13 +243,19 @@ dri3_present_sync_init(struct loader_dri3_drawable *draw, int buffer_fd)
    if (sync->cancel_fd < 0)
       goto fail;
 
+   sync->fault_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+   if (sync->fault_fd < 0)
+      goto fail_cancel_fd;
+
    if (!util_queue_init(&sync->queue, "present", 8, 1,
                         UTIL_QUEUE_INIT_RESIZE_IF_FULL, NULL))
-      goto fail_cancel_fd;
+      goto fail_fault_fd;
 
    draw->present_sync = sync;
    return true;
 
+fail_fault_fd:
+   close(sync->fault_fd);
 fail_cancel_fd:
    close(sync->cancel_fd);
 fail:
@@ -301,6 +323,15 @@ dri3_queue_present_wait_fence(struct loader_dri3_drawable *draw,
    if (fence_fd < 0)
       return XCB_NONE;
 
+   /* Reject a malformed descriptor before a Present request can acquire an
+    * X fence which can never be triggered.  A later GPU fence error is still
+    * reported asynchronously and must remain quarantined. */
+   if (!sync_valid_fd(fence_fd)) {
+      mesa_loge("DRI3: refusing invalid native presentation fence");
+      close(fence_fd);
+      return DRI3_PRESENT_WAIT_FENCE_FAILED;
+   }
+
    if (!draw->present_sync || !buffer->present_wait_fence)
       goto sync_fallback;
 
@@ -342,6 +373,7 @@ dri3_queue_present_wait_fence(struct loader_dri3_drawable *draw,
    job->fence_status = &buffer->present_wait_fence_status;
    job->fence_fd = fence_fd;
    job->cancel_fd = draw->present_sync->cancel_fd;
+   job->fault_fd = draw->present_sync->fault_fd;
 
    util_queue_add_job(&draw->present_sync->queue, job, &buffer->present_wait_job,
                       dri3_present_job_execute, dri3_present_job_cleanup,
@@ -1129,9 +1161,15 @@ dri3_wait_for_event_locked_timeout(struct loader_dri3_drawable *draw,
    while (!(ev = xcb_poll_for_special_event(draw->conn,
                                              draw->special_event))) {
       int64_t remaining_ns = deadline_ns - os_time_get_nano();
-      struct pollfd pfd = {
-         .fd = xcb_get_file_descriptor(draw->conn),
-         .events = POLLIN,
+      struct pollfd fds[2] = {
+         {
+            .fd = xcb_get_file_descriptor(draw->conn),
+            .events = POLLIN,
+         },
+         {
+            .fd = draw->present_sync ? draw->present_sync->fault_fd : -1,
+            .events = POLLIN,
+         },
       };
       int poll_timeout_ms;
       int ret;
@@ -1143,10 +1181,11 @@ dri3_wait_for_event_locked_timeout(struct loader_dri3_drawable *draw,
                              DRI3_PRESENT_EVENT_POLL_SLICE_MS);
 
       do {
-         ret = poll(&pfd, 1, poll_timeout_ms);
+         ret = poll(fds, ARRAY_SIZE(fds), poll_timeout_ms);
       } while (ret < 0 && errno == EINTR);
 
-      if (ret < 0 || (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)))
+      if (ret < 0 || (fds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) ||
+          (fds[1].revents & (POLLIN | POLLERR | POLLHUP | POLLNVAL)))
          break;
    }
 
@@ -1773,6 +1812,17 @@ loader_dri3_swap_buffers_msc(struct loader_dri3_drawable *draw,
          os_time_get() - wait_start_us, os_time_get());
    }
 
+   /* The current frame's worker is started before the commitment wait so its
+    * native dependency can progress in parallel.  If that worker failed while
+    * we were waiting, reject the not-yet-submitted frame instead of handing
+    * Present an X fence which can never be triggered. */
+   if (tracked_present && dri3_present_sync_faulted(draw)) {
+      loader_dri3_pacer_cancel(&draw->pacer, submitted_serial, os_time_get());
+      mtx_unlock(&draw->mtx);
+      dri_invalidate_drawable(draw->dri_drawable);
+      return ret;
+   }
+
    if (draw->type == LOADER_DRI3_DRAWABLE_WINDOW) {
       dri3_fence_reset(draw->conn, back);
 
@@ -1870,7 +1920,8 @@ loader_dri3_swap_buffers_msc(struct loader_dri3_drawable *draw,
          render_fence_fd = -1;
       }
 
-      if (wait_fence == DRI3_PRESENT_WAIT_FENCE_FAILED) {
+      if (wait_fence == DRI3_PRESENT_WAIT_FENCE_FAILED ||
+          dri3_present_sync_faulted(draw)) {
          if (tracked_present)
             loader_dri3_pacer_cancel(&draw->pacer, submitted_serial,
                                      os_time_get());
