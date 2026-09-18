@@ -24,7 +24,17 @@ if with_platform_x11
   if with_dri_platform == 'drm' or with_dri_platform == 'pseudo-drm'
     deps_for_libdri += [dep_xcb_dri3, dep_xcb_present, dep_xcb_sync,
                         dep_xshmfence, dep_xcb_xfixes]
-    files_libdri += files('loader_dri3_helper.c')
+    files_libdri += files(
+      'loader_dri3_helper.c',
+      'loader_dri3_pacer.c',
+      'loader_dri3_pacer.h',
+    )
+  endif
+endif
+
+if with_tests and meson.can_run_host_binaries() and with_platform_x11
+  if with_dri_platform == 'drm' or with_dri_platform == 'pseudo-drm'
+    subdir('tests')
   endif
 endif
 

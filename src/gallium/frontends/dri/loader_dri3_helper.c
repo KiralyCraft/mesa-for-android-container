@@ -75,8 +75,10 @@ struct loader_dri3_present_sync {
 };
 
 struct loader_dri3_present_job {
+   struct loader_dri3_drawable *draw;
    xcb_connection_t *conn;
    xcb_sync_fence_t fence;
+   uint64_t serial;
    int *fence_status;
    int fence_fd;
    int cancel_fd;
@@ -136,6 +138,11 @@ dri3_present_job_execute(void *data, void *gdata, int thread_index)
    xcb_sync_trigger_fence(job->conn, job->fence);
    p_atomic_set(job->fence_status, DRI3_PRESENT_WAIT_TRIGGERED);
    xcb_flush(job->conn);
+
+   mtx_lock(&job->draw->mtx);
+   loader_dri3_pacer_note_producer_ready(&job->draw->pacer, job->serial,
+                                         os_time_get());
+   mtx_unlock(&job->draw->mtx);
 }
 
 static void
@@ -245,7 +252,7 @@ dri3_setup_present_wait_fence(struct loader_dri3_drawable *draw,
 static xcb_sync_fence_t
 dri3_queue_present_wait_fence(struct loader_dri3_drawable *draw,
                               struct loader_dri3_buffer *buffer,
-                              int fence_fd)
+                              int fence_fd, uint64_t serial)
 {
    struct loader_dri3_present_job *job;
 
@@ -285,8 +292,10 @@ dri3_queue_present_wait_fence(struct loader_dri3_drawable *draw,
    if (!job)
       goto sync_fallback;
 
+   job->draw = draw;
    job->conn = draw->conn;
    job->fence = buffer->present_wait_fence;
+   job->serial = serial;
    job->fence_status = &buffer->present_wait_fence_status;
    job->fence_fd = fence_fd;
    job->cancel_fd = draw->present_sync->cancel_fd;
@@ -304,6 +313,8 @@ sync_fallback:
       return DRI3_PRESENT_WAIT_FENCE_FAILED;
    }
    close(fence_fd);
+   loader_dri3_pacer_note_producer_ready(&draw->pacer, serial,
+                                         os_time_get());
    return XCB_NONE;
 }
 
@@ -363,7 +374,7 @@ dri3_pacing_supported(const struct loader_dri3_drawable *draw)
                              LORIE_PRESENT_CAP_FRAME_TIMELINE;
 
    return draw->present_mode != LOADER_DRI3_PRESENT_UNPACED &&
-          !draw->pacing_timed_out &&
+          !draw->pacer.timing_timed_out &&
           draw->type == LOADER_DRI3_DRAWABLE_WINDOW &&
           draw->present_sync &&
           (draw->present_capabilities & required) == required;
@@ -585,7 +596,7 @@ dri3_update_max_num_back(struct loader_dri3_drawable *draw)
       LORIE_PRESENT_CAP_FRAME_TIMELINE;
 
    if (draw->present_mode != LOADER_DRI3_PRESENT_UNPACED &&
-       !draw->pacing_timed_out && draw->swap_interval == 0 &&
+       !draw->pacer.timing_timed_out && draw->swap_interval == 0 &&
        (draw->present_capabilities & pacing_caps) == pacing_caps) {
       /* Allocation capacity is independent from permission to render ahead.
        * Two buffers are sufficient for the initial bounded FIFO policy. */
@@ -702,14 +713,37 @@ dri3_free_render_buffer(struct loader_dri3_drawable *draw,
 void
 loader_dri3_drawable_fini(struct loader_dri3_drawable *draw)
 {
+   struct loader_dri3_pacer_snapshot snapshot;
    int i;
 
-   if (draw->pacing_trace &&
-       (draw->pacing_wait_count || draw->pacing_timeout_count)) {
-      mesa_logi("DRI3 pacing: waits=%" PRIu64 " wait_us=%" PRIu64
-                " timeouts=%" PRIu64 " completes=%" PRIu64,
-                draw->pacing_wait_count, draw->pacing_wait_us,
-                draw->pacing_timeout_count, draw->pacing_complete_count);
+   if (draw->pacing_trace) {
+      loader_dri3_pacer_snapshot(&draw->pacer, os_time_get(), &snapshot);
+      mesa_logi("DRI3 pacing: admission_delay=%s admitted=%" PRIu64
+                " ready=%" PRIu64 " submitted=%" PRIu64
+                " completed=%" PRIu64 " released=%" PRIu64
+                " late=%" PRIu64 " ledger_overflows=%" PRIu64,
+                draw->admission_pacing ? "enabled" : "disabled",
+                snapshot.stats.admitted, snapshot.stats.producer_ready,
+                snapshot.stats.submitted, snapshot.stats.completed,
+                snapshot.stats.storage_released,
+                snapshot.stats.late_completions,
+                snapshot.stats.ledger_overflows);
+      mesa_logi("DRI3 pacing: period_us=%" PRIu64
+                " production_p95_us=%" PRIu64
+                " ready_residence_p95_us=%" PRIu64
+                " commitment_waits=%" PRIu64
+                " commitment_wait_us=%" PRIu64
+                " admission_waits=%" PRIu64
+                " admission_wait_us=%" PRIu64
+                " window_outstanding=%u window_retained=%u",
+                snapshot.period_us, snapshot.production_p95_us,
+                snapshot.ready_residence_p95_us,
+                snapshot.stats.block_count[LOADER_DRI3_PACER_BLOCK_COMMITMENT],
+                snapshot.stats.block_us[LOADER_DRI3_PACER_BLOCK_COMMITMENT],
+                snapshot.stats.block_count[LOADER_DRI3_PACER_BLOCK_ADMISSION],
+                snapshot.stats.block_us[LOADER_DRI3_PACER_BLOCK_ADMISSION],
+                snapshot.window_max_outstanding,
+                snapshot.window_max_retained);
    }
 
    dri3_present_sync_fini(draw);
@@ -764,9 +798,9 @@ loader_dri3_drawable_init(xcb_connection_t *conn,
    draw->present_sync = NULL;
    draw->present_mode = LOADER_DRI3_PRESENT_UNPACED;
    draw->present_capabilities = 0;
-   draw->pacing_timed_out = false;
+   draw->admission_pacing = true;
    draw->pacing_trace = false;
-   draw->pacing_period_us = 16667;
+   loader_dri3_pacer_init(&draw->pacer, os_time_get());
 
    draw->have_back = 0;
    draw->have_fake_front = 0;
@@ -806,6 +840,8 @@ loader_dri3_drawable_init(xcb_connection_t *conn,
       draw->present_mode =
          dri3_parse_present_mode(present_mode_env ? present_mode_env :
                                                     present_mode);
+      draw->admission_pacing =
+         debug_get_bool_option("MESA_DRI3_ADMISSION_PACING", true);
       draw->pacing_trace =
          debug_get_bool_option("MESA_DRI3_PRESENT_TRACE", false);
    }
@@ -865,6 +901,8 @@ dri3_handle_present_event(struct loader_dri3_drawable *draw,
    switch (ge->evtype) {
    case XCB_PRESENT_EVENT_CONFIGURE_NOTIFY: {
       xcb_present_configure_notify_event_t *ce = (void *) ge;
+      bool size_changed = draw->width != ce->width || draw->height != ce->height;
+
       if (ce->pixmap_flags & PresentWindowDestroyed) {
          free(ge);
          return false;
@@ -872,6 +910,8 @@ dri3_handle_present_event(struct loader_dri3_drawable *draw,
 
       draw->width = ce->width;
       draw->height = ce->height;
+      if (size_changed)
+         loader_dri3_pacer_reset_generation(&draw->pacer, os_time_get());
       draw->vtable->set_drawable_size(draw, draw->width, draw->height);
       dri_invalidate_drawable(draw->dri_drawable);
       break;
@@ -886,6 +926,7 @@ dri3_handle_present_event(struct loader_dri3_drawable *draw,
       if (ce->kind == XCB_PRESENT_COMPLETE_KIND_PIXMAP) {
          uint64_t recv_sbc = (draw->send_sbc & 0xffffffff00000000LL) | ce->serial;
          bool timing_recovered = false;
+         bool accepted_completion = false;
 
          /* Only assume wraparound if that results in exactly the previous
           * SBC + 1, otherwise ignore received SBC > sent SBC (those are
@@ -894,10 +935,14 @@ dri3_handle_present_event(struct loader_dri3_drawable *draw,
           * Since events can be received out of order, don't let recv_sbc go
           * back unless for wraparound.
           */
-         if (recv_sbc <= draw->send_sbc && draw->recv_sbc <= recv_sbc)
+         if (recv_sbc <= draw->send_sbc && draw->recv_sbc <= recv_sbc) {
             draw->recv_sbc = recv_sbc;
-         else if (recv_sbc == (draw->recv_sbc + 0x100000001ULL))
+            accepted_completion = true;
+         } else if (recv_sbc == (draw->recv_sbc + 0x100000001ULL)) {
             draw->recv_sbc = recv_sbc - 0x100000000ULL;
+            recv_sbc = draw->recv_sbc;
+            accepted_completion = true;
+         }
 
          /* When moving from flip to copy, we assume that we can allocate in
           * a more optimal way if we don't need to cater for the display
@@ -925,18 +970,9 @@ dri3_handle_present_event(struct loader_dri3_drawable *draw,
 
          draw->ust = ce->ust;
          draw->msc = ce->msc;
-         if (draw->pacing_last_complete_ust &&
-             ce->ust > draw->pacing_last_complete_ust) {
-            uint64_t sample = ce->ust - draw->pacing_last_complete_ust;
-
-            if (sample >= 4000 && sample <= 100000) {
-               draw->pacing_period_us =
-                  (draw->pacing_period_us * 7 + sample) / 8;
-               timing_recovered = draw->pacing_timed_out;
-            }
-         }
-         draw->pacing_last_complete_ust = ce->ust;
-         draw->pacing_complete_count++;
+         if (accepted_completion)
+            timing_recovered = loader_dri3_pacer_note_complete(
+               &draw->pacer, recv_sbc, ce->ust, ce->msc, os_time_get());
 
          /* A bounded wait deliberately falls back when Present feedback goes
           * stale.  That fallback must not permanently disable pacing after a
@@ -945,7 +981,6 @@ dri3_handle_present_event(struct loader_dri3_drawable *draw,
           * again.  Producer fences and buffer ownership remain independent of
           * this timing-only recovery. */
          if (timing_recovered) {
-            draw->pacing_timed_out = false;
             mesa_logi("DRI3: paced Present feedback resumed");
          }
       } else if (ce->serial == draw->eid) {
@@ -961,8 +996,11 @@ dri3_handle_present_event(struct loader_dri3_drawable *draw,
       for (b = 0; b < ARRAY_SIZE(draw->buffers); b++) {
          struct loader_dri3_buffer *buf = draw->buffers[b];
 
-         if (buf && buf->pixmap == ie->pixmap)
+         if (buf && buf->pixmap == ie->pixmap) {
             buf->busy = 0;
+            loader_dri3_pacer_note_storage_released(
+               &draw->pacer, buf->last_swap, os_time_get());
+         }
       }
       break;
    }
@@ -1486,6 +1524,11 @@ loader_dri3_swap_buffers_msc(struct loader_dri3_drawable *draw,
    struct loader_dri3_buffer *back;
    int64_t ret = 0;
    int render_fence_fd = -1;
+   uint64_t frame_admitted_us = 0;
+   uint64_t frame_admitted_generation = 0;
+   uint64_t producer_ready_observed_us = 0;
+   uint64_t admission_deadline_us = 0;
+   uint64_t submitted_serial = 0;
    bool paced_present = false;
    bool wait_for_next_buffer = false;
 
@@ -1525,6 +1568,10 @@ loader_dri3_swap_buffers_msc(struct loader_dri3_drawable *draw,
    paced_present = draw->swap_interval == 0 && target_msc == 0 &&
                    divisor == 0 && remainder == 0 && !force_copy &&
                    dri3_pacing_supported(draw);
+   if (paced_present) {
+      frame_admitted_us = draw->pacer.current_admission_us;
+      frame_admitted_generation = draw->pacer.generation;
+   }
 
    if (draw->type == LOADER_DRI3_DRAWABLE_WINDOW &&
        draw->present_sync &&
@@ -1533,6 +1580,13 @@ loader_dri3_swap_buffers_msc(struct loader_dri3_drawable *draw,
          draw->vtable->flush_drawable_with_fence_fd(draw, flush_flags);
    } else {
       draw->vtable->flush_drawable(draw, flush_flags);
+   }
+
+   if (paced_present && render_fence_fd >= 0) {
+      struct pollfd ready = { .fd = render_fence_fd, .events = POLLIN };
+
+      if (poll(&ready, 1, 0) == 1 && (ready.revents & POLLIN))
+         producer_ready_observed_us = os_time_get();
    }
 
    back = dri3_find_back_alloc(draw);
@@ -1595,12 +1649,11 @@ loader_dri3_swap_buffers_msc(struct loader_dri3_drawable *draw,
     */
    if (paced_present && draw->recv_sbc != draw->send_sbc) {
       uint64_t wait_start_us = os_time_get();
-      int timeout_ms = MAX2((int) DIV_ROUND_UP(draw->pacing_period_us * 3,
+      int timeout_ms = MAX2((int) DIV_ROUND_UP(draw->pacer.period_us * 3,
                                                1000),
                             100);
       uint64_t wait_deadline_us = wait_start_us + timeout_ms * 1000ULL;
 
-      draw->pacing_wait_count++;
       while (draw->recv_sbc != draw->send_sbc) {
          int64_t remaining_us = wait_deadline_us - os_time_get();
          int remaining_ms = remaining_us > 0 ?
@@ -1608,8 +1661,7 @@ loader_dri3_swap_buffers_msc(struct loader_dri3_drawable *draw,
 
          if (!remaining_ms ||
              !dri3_wait_for_event_locked_timeout(draw, remaining_ms)) {
-            draw->pacing_timeout_count++;
-            draw->pacing_timed_out = true;
+            loader_dri3_pacer_timing_timeout(&draw->pacer, os_time_get());
             paced_present = false;
             mesa_loge("DRI3: paced Present feedback stale for %d ms; "
                       "temporarily falling back to synchronized unpaced "
@@ -1618,7 +1670,9 @@ loader_dri3_swap_buffers_msc(struct loader_dri3_drawable *draw,
             break;
          }
       }
-      draw->pacing_wait_us += os_time_get() - wait_start_us;
+      loader_dri3_pacer_note_block(
+         &draw->pacer, LOADER_DRI3_PACER_BLOCK_COMMITMENT,
+         os_time_get() - wait_start_us, os_time_get());
    }
 
    if (draw->type == LOADER_DRI3_DRAWABLE_WINDOW) {
@@ -1673,6 +1727,25 @@ loader_dri3_swap_buffers_msc(struct loader_dri3_drawable *draw,
       }
 
       ++draw->send_sbc;
+      submitted_serial = draw->send_sbc;
+
+      if (frame_admitted_generation != draw->pacer.generation)
+         frame_admitted_us = 0;
+
+      if (paced_present &&
+          !loader_dri3_pacer_reserve(&draw->pacer, submitted_serial,
+                                     target_msc, frame_admitted_us,
+                                     os_time_get())) {
+         mesa_loge("DRI3: paced frame ledger lost submission credit; "
+                   "temporarily falling back to synchronized unpaced "
+                   "presentation");
+         loader_dri3_pacer_timing_timeout(&draw->pacer, os_time_get());
+         paced_present = false;
+      }
+
+      if (paced_present && producer_ready_observed_us)
+         loader_dri3_pacer_note_producer_ready(
+            &draw->pacer, submitted_serial, producer_ready_observed_us);
 
       /* From the GLX_EXT_swap_control spec
        * and the EGL 1.4 spec (page 53):
@@ -1707,9 +1780,13 @@ loader_dri3_swap_buffers_msc(struct loader_dri3_drawable *draw,
          options |= XCB_PRESENT_OPTION_SUBOPTIMAL;
 
       xcb_sync_fence_t wait_fence =
-         dri3_queue_present_wait_fence(draw, back, render_fence_fd);
+         dri3_queue_present_wait_fence(draw, back, render_fence_fd,
+                                       submitted_serial);
 
       if (wait_fence == DRI3_PRESENT_WAIT_FENCE_FAILED) {
+         if (submitted_serial)
+            loader_dri3_pacer_cancel(&draw->pacer, submitted_serial,
+                                     os_time_get());
          draw->send_sbc--;
          mtx_unlock(&draw->mtx);
          dri_invalidate_drawable(draw->dri_drawable);
@@ -1736,6 +1813,14 @@ loader_dri3_swap_buffers_msc(struct loader_dri3_drawable *draw,
                          target_msc,
                          divisor,
                          remainder, 0, NULL);
+
+      if (paced_present) {
+         loader_dri3_pacer_note_submitted(&draw->pacer, submitted_serial,
+                                          os_time_get());
+         if (draw->admission_pacing)
+            admission_deadline_us = loader_dri3_pacer_next_admission(
+               &draw->pacer, target_msc, os_time_get());
+      }
    } else {
       /* This can only be reached by double buffered GLXPbuffer. */
       assert(draw->type == LOADER_DRI3_DRAWABLE_PBUFFER);
@@ -1803,6 +1888,24 @@ loader_dri3_swap_buffers_msc(struct loader_dri3_drawable *draw,
    mtx_unlock(&draw->mtx);
 
    dri_invalidate_drawable(draw->dri_drawable);
+
+   if (paced_present) {
+      uint64_t wait_start_us = os_time_get();
+      bool waited_for_admission = admission_deadline_us > wait_start_us;
+
+      if (waited_for_admission)
+         os_time_nanosleep_until(admission_deadline_us * 1000);
+
+      uint64_t admitted_us = os_time_get();
+      mtx_lock(&draw->mtx);
+      if (waited_for_admission) {
+         loader_dri3_pacer_note_block(
+            &draw->pacer, LOADER_DRI3_PACER_BLOCK_ADMISSION,
+            admitted_us - wait_start_us, admitted_us);
+      }
+      loader_dri3_pacer_admit_next(&draw->pacer, admitted_us);
+      mtx_unlock(&draw->mtx);
+   }
 
    /* Clients that use up all available buffers usually regulate their drawing
     * through swapchain contention backpressure. In such a scenario the client

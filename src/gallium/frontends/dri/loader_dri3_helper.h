@@ -33,6 +33,7 @@
 
 #include <GL/gl.h>
 #include "mesa_interface.h"
+#include "loader_dri3_pacer.h"
 #include "util/macros.h"
 #include "util/u_queue.h"
 #include <c11/threads.h>
@@ -182,17 +183,12 @@ struct loader_dri3_drawable {
    bool block_on_depleted_buffers;
    bool queries_buffer_age;
    bool present_sync_checked;
-   bool pacing_timed_out;
+   bool admission_pacing;
    bool pacing_trace;
    int swap_interval;
    enum loader_dri3_present_mode present_mode;
    uint32_t present_capabilities;
-   uint64_t pacing_wait_count;
-   uint64_t pacing_wait_us;
-   uint64_t pacing_timeout_count;
-   uint64_t pacing_complete_count;
-   uint64_t pacing_last_complete_ust;
-   uint64_t pacing_period_us;
+   struct loader_dri3_pacer pacer;
 
    struct loader_dri3_present_sync *present_sync;
 
