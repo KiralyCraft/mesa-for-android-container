@@ -9,9 +9,7 @@
 #include <string.h>
 
 static void
-pacer_observe(struct loader_dri3_pacer *pacer,
-              enum loader_dri3_pacer_block_reason reason,
-              uint64_t now_us)
+pacer_observe(struct loader_dri3_pacer *pacer, uint64_t now_us)
 {
    struct loader_dri3_pacer_observation *observation =
       &pacer->observations[pacer->observation_head];
@@ -20,7 +18,6 @@ pacer_observe(struct loader_dri3_pacer *pacer,
       .at_us = now_us,
       .outstanding_frames = pacer->outstanding_frames,
       .retained_allocations = pacer->retained_allocations,
-      .reason = reason,
    };
    pacer->observation_head =
       (pacer->observation_head + 1) % LOADER_DRI3_PACER_HISTORY_SIZE;
@@ -118,7 +115,6 @@ loader_dri3_pacer_reset_generation(struct loader_dri3_pacer *pacer,
    pacer->period_us = 16667;
    pacer->last_complete_ust = 0;
    pacer->last_complete_msc = 0;
-   pacer->last_complete_local_us = 0;
    pacer->production_head = 0;
    pacer->production_count = 0;
    pacer->residence_head = 0;
@@ -129,13 +125,7 @@ loader_dri3_pacer_reset_generation(struct loader_dri3_pacer *pacer,
    memset(pacer->production_us, 0, sizeof(pacer->production_us));
    memset(pacer->ready_residence_us, 0, sizeof(pacer->ready_residence_us));
    pacer->stats.admitted++;
-   pacer_observe(pacer, LOADER_DRI3_PACER_BLOCK_ADMISSION, now_us);
-}
-
-bool
-loader_dri3_pacer_submission_credit(const struct loader_dri3_pacer *pacer)
-{
-   return pacer->outstanding_frames == 0;
+   pacer_observe(pacer, now_us);
 }
 
 bool
@@ -178,7 +168,7 @@ loader_dri3_pacer_reserve(struct loader_dri3_pacer *pacer,
       .admitted_us = admitted_us,
       .reserved = true,
    };
-   pacer_observe(pacer, LOADER_DRI3_PACER_BLOCK_COMMITMENT, now_us);
+   pacer_observe(pacer, now_us);
    return true;
 }
 
@@ -206,7 +196,6 @@ loader_dri3_pacer_note_producer_ready(struct loader_dri3_pacer *pacer,
    pacer->stats.producer_ready++;
    if (frame->cancelled && !frame->submitted) {
       frame->storage_released = true;
-      frame->storage_released_us = now_us;
       pacer->stats.storage_released++;
    }
    if (frame->admitted_us && now_us >= frame->admitted_us &&
@@ -249,7 +238,7 @@ loader_dri3_pacer_note_submitted(struct loader_dri3_pacer *pacer,
                           now_us - frame->producer_ready_us : 0);
       frame->residence_sampled = true;
    }
-   pacer_observe(pacer, LOADER_DRI3_PACER_BLOCK_COMMITMENT, now_us);
+   pacer_observe(pacer, now_us);
 }
 
 bool
@@ -279,7 +268,6 @@ loader_dri3_pacer_note_complete(struct loader_dri3_pacer *pacer,
    if (!pacer->generation_needs_current_completion || current_generation) {
       pacer->last_complete_ust = ust;
       pacer->last_complete_msc = msc;
-      pacer->last_complete_local_us = now_us;
       pacer->generation_needs_current_completion = false;
    }
 
@@ -287,15 +275,12 @@ loader_dri3_pacer_note_complete(struct loader_dri3_pacer *pacer,
       return recovered;
 
    frame->completed = true;
-   frame->completed_us = now_us;
-   frame->completed_ust = ust;
-   frame->completed_msc = msc;
    if (frame->submitted && pacer->outstanding_frames)
       pacer->outstanding_frames--;
    if (msc > frame->target_msc)
       pacer->stats.late_completions++;
    pacer->stats.completed++;
-   pacer_observe(pacer, LOADER_DRI3_PACER_BLOCK_COMMITMENT, now_us);
+   pacer_observe(pacer, now_us);
    return recovered;
 }
 
@@ -309,11 +294,10 @@ loader_dri3_pacer_note_storage_released(struct loader_dri3_pacer *pacer,
       return;
 
    frame->storage_released = true;
-   frame->storage_released_us = now_us;
    if (frame->submitted && pacer->retained_allocations)
       pacer->retained_allocations--;
    pacer->stats.storage_released++;
-   pacer_observe(pacer, LOADER_DRI3_PACER_BLOCK_BUFFER, now_us);
+   pacer_observe(pacer, now_us);
 }
 
 void
@@ -327,9 +311,7 @@ loader_dri3_pacer_cancel(struct loader_dri3_pacer *pacer,
 
    frame->cancelled = true;
    frame->storage_released = frame->producer_ready;
-   frame->storage_released_us = frame->producer_ready ? now_us : 0;
-   pacer->stats.cancelled++;
-   pacer_observe(pacer, LOADER_DRI3_PACER_BLOCK_COMMITMENT, now_us);
+   pacer_observe(pacer, now_us);
 }
 
 void
@@ -342,7 +324,7 @@ loader_dri3_pacer_note_block(struct loader_dri3_pacer *pacer,
 
    pacer->stats.block_count[reason]++;
    pacer->stats.block_us[reason] += duration_us;
-   pacer_observe(pacer, reason, now_us);
+   pacer_observe(pacer, now_us);
 }
 
 void
@@ -351,7 +333,7 @@ loader_dri3_pacer_timing_timeout(struct loader_dri3_pacer *pacer,
 {
    pacer->timing_timed_out = true;
    pacer->timing_valid = false;
-   pacer_observe(pacer, LOADER_DRI3_PACER_BLOCK_STALE_TIMELINE, now_us);
+   pacer_observe(pacer, now_us);
 }
 
 uint64_t
@@ -405,7 +387,7 @@ loader_dri3_pacer_admit_next(struct loader_dri3_pacer *pacer,
 {
    pacer->current_admission_us = now_us;
    pacer->stats.admitted++;
-   pacer_observe(pacer, LOADER_DRI3_PACER_BLOCK_ADMISSION, now_us);
+   pacer_observe(pacer, now_us);
 }
 
 void
@@ -422,10 +404,6 @@ loader_dri3_pacer_snapshot(const struct loader_dri3_pacer *pacer,
    snapshot->production_p95_us = loader_dri3_pacer_production_p95(pacer);
    snapshot->ready_residence_p95_us =
       pacer_percentile(pacer->ready_residence_us, pacer->residence_count, 95);
-   snapshot->outstanding_frames = pacer->outstanding_frames;
-   snapshot->retained_allocations = pacer->retained_allocations;
-   snapshot->timing_valid = pacer->timing_valid;
-   snapshot->timing_timed_out = pacer->timing_timed_out;
 
    for (unsigned i = 0; i < pacer->observation_count; i++) {
       const struct loader_dri3_pacer_observation *observation =

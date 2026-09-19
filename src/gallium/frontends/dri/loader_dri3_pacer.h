@@ -17,8 +17,6 @@
 enum loader_dri3_pacer_block_reason {
    LOADER_DRI3_PACER_BLOCK_COMMITMENT,
    LOADER_DRI3_PACER_BLOCK_ADMISSION,
-   LOADER_DRI3_PACER_BLOCK_BUFFER,
-   LOADER_DRI3_PACER_BLOCK_STALE_TIMELINE,
    LOADER_DRI3_PACER_BLOCK_REASON_COUNT,
 };
 
@@ -29,10 +27,6 @@ struct loader_dri3_pacer_frame {
    uint64_t admitted_us;
    uint64_t producer_ready_us;
    uint64_t submitted_us;
-   uint64_t completed_us;
-   uint64_t completed_ust;
-   uint64_t completed_msc;
-   uint64_t storage_released_us;
    bool reserved;
    bool producer_ready;
    bool submitted;
@@ -46,7 +40,6 @@ struct loader_dri3_pacer_observation {
    uint64_t at_us;
    uint32_t outstanding_frames;
    uint32_t retained_allocations;
-   enum loader_dri3_pacer_block_reason reason;
 };
 
 struct loader_dri3_pacer_stats {
@@ -55,7 +48,6 @@ struct loader_dri3_pacer_stats {
    uint64_t submitted;
    uint64_t completed;
    uint64_t storage_released;
-   uint64_t cancelled;
    uint64_t ledger_overflows;
    uint64_t late_completions;
    uint64_t block_count[LOADER_DRI3_PACER_BLOCK_REASON_COUNT];
@@ -67,12 +59,8 @@ struct loader_dri3_pacer_snapshot {
    uint64_t period_us;
    uint64_t production_p95_us;
    uint64_t ready_residence_p95_us;
-   uint32_t outstanding_frames;
-   uint32_t retained_allocations;
    uint32_t window_max_outstanding;
    uint32_t window_max_retained;
-   bool timing_valid;
-   bool timing_timed_out;
 };
 
 struct loader_dri3_pacer {
@@ -88,7 +76,6 @@ struct loader_dri3_pacer {
    uint64_t margin_us;
    uint64_t last_complete_ust;
    uint64_t last_complete_msc;
-   uint64_t last_complete_local_us;
    uint32_t production_head;
    uint32_t production_count;
    uint32_t residence_head;
@@ -108,9 +95,6 @@ loader_dri3_pacer_init(struct loader_dri3_pacer *pacer, uint64_t now_us);
 void
 loader_dri3_pacer_reset_generation(struct loader_dri3_pacer *pacer,
                                    uint64_t now_us);
-
-bool
-loader_dri3_pacer_submission_credit(const struct loader_dri3_pacer *pacer);
 
 bool
 loader_dri3_pacer_production_credit(const struct loader_dri3_pacer *pacer);
