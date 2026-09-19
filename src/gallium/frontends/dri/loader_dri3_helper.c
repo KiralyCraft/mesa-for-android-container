@@ -1212,6 +1212,46 @@ dri3_handle_present_event(struct loader_dri3_drawable *draw,
             timing_recovered = loader_dri3_pacer_note_complete(
                &draw->pacer, recv_sbc, ce->ust, ce->msc, os_time_get());
 
+         /* DEBUG: Some applications exit without destroying their main GLX
+          * drawable, so the opt-in final snapshot is never emitted.  Keep
+          * tracing useful without adding per-frame logging by publishing one
+          * cumulative snapshot every 300 accepted completions. */
+         if (draw->pacing_trace && accepted_completion &&
+             draw->pacer.stats.completed &&
+             draw->pacer.stats.completed % 300 == 0) {
+            struct loader_dri3_pacer_snapshot snapshot;
+
+            loader_dri3_pacer_snapshot(&draw->pacer, os_time_get(),
+                                       &snapshot);
+            mesa_logi("DEBUG: DRI3 pacing periodic: admitted=%" PRIu64
+                      " ready=%" PRIu64 " submitted=%" PRIu64
+                      " backend_released=%" PRIu64
+                      " completed=%" PRIu64 " released=%" PRIu64
+                      " late=%" PRIu64 " period_us=%" PRIu64
+                      " production_p95_us=%" PRIu64
+                      " ready_residence_p95_us=%" PRIu64
+                      " submission_completion_p95_us=%" PRIu64
+                      " actual_presented=%" PRIu64
+                      " actual_unknown=%" PRIu64
+                      " timeline_updates=%" PRIu64
+                      " timeline_invalid=%" PRIu64,
+                      snapshot.stats.admitted,
+                      snapshot.stats.producer_ready,
+                      snapshot.stats.submitted,
+                      snapshot.stats.backend_released,
+                      snapshot.stats.completed,
+                      snapshot.stats.storage_released,
+                      snapshot.stats.late_completions,
+                      snapshot.period_us,
+                      snapshot.production_p95_us,
+                      snapshot.ready_residence_p95_us,
+                      snapshot.submission_completion_p95_us,
+                      snapshot.stats.actual_presented,
+                      snapshot.stats.actual_unknown,
+                      snapshot.stats.timeline_updates,
+                      snapshot.stats.timeline_invalid);
+         }
+
          /* A bounded wait deliberately falls back when Present feedback goes
           * stale.  That fallback must not permanently disable pacing after a
           * transient server or Android scheduling delay: a later monotonic,
