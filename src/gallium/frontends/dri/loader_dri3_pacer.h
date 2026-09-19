@@ -97,6 +97,7 @@ struct loader_dri3_pacer_snapshot {
    uint64_t submission_completion_p95_us;
    uint64_t storage_retention_p95_us;
    uint64_t submission_actual_p95_us;
+   uint64_t timeline_opportunity_us;
    uint64_t timeline_deadline_us;
    uint64_t timeline_expected_us;
    uint64_t timeline_msc;
@@ -130,6 +131,7 @@ struct loader_dri3_pacer {
    uint64_t last_complete_ust;
    uint64_t last_complete_msc;
    uint64_t last_complete_local_us;
+   uint64_t last_timeline_opportunity_us;
    uint64_t last_timeline_deadline_us;
    uint64_t last_timeline_expected_us;
    uint64_t last_timeline_msc;
@@ -201,6 +203,7 @@ void
 loader_dri3_pacer_note_timeline(struct loader_dri3_pacer *pacer,
                                 uint64_t deadline_us,
                                 uint64_t expected_us,
+                                uint64_t opportunity_us,
                                 uint64_t opportunity_msc,
                                 uint64_t now_us);
 

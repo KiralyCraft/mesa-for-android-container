@@ -106,6 +106,9 @@ enum dri3_present_wait_status {
  * experimental server which only drives fake MSC from Choreographer cannot
  * be mistaken for a deadline publisher. */
 #define LORIE_PRESENT_CAP_TIMELINE_NOTIFY          (1u << 26)
+/* Version 2 transports the callback/frame-time at which Termux:X11 selected
+ * X contents separately from Android's later renderer deadline. */
+#define LORIE_PRESENT_CAP_TIMELINE_OPPORTUNITY     (1u << 25)
 #define LORIE_PRESENT_OPTION_BACKEND_RELEASE      (1u << 30)
 #define LORIE_PRESENT_OPTION_ACTUAL_FEEDBACK      (1u << 31)
 #define LORIE_PRESENT_COMPLETE_KIND_ACTUAL        2
@@ -490,7 +493,8 @@ dri3_pacing_supported(const struct loader_dri3_drawable *draw)
    const uint32_t required = LORIE_PRESENT_CAP_WAIT_FENCE_REQUEUE_SAFE |
                              LORIE_PRESENT_CAP_VBLANK_COMPLETE |
                              LORIE_PRESENT_CAP_FRAME_TIMELINE |
-                             LORIE_PRESENT_CAP_TIMELINE_NOTIFY;
+                             LORIE_PRESENT_CAP_TIMELINE_NOTIFY |
+                             LORIE_PRESENT_CAP_TIMELINE_OPPORTUNITY;
 
    return draw->present_mode != LOADER_DRI3_PRESENT_UNPACED &&
           !draw->pacer.timing_timed_out &&
@@ -903,12 +907,14 @@ loader_dri3_drawable_fini(struct loader_dri3_drawable *draw)
       mesa_logi("DRI3 pacing: timeline_updates=%" PRIu64
                 " timeline_invalid=%" PRIu64
                 " timeline_valid=%s timeline_msc=%" PRIu64
+                " timeline_opportunity_us=%" PRIu64
                 " timeline_deadline_us=%" PRIu64
                 " timeline_expected_us=%" PRIu64,
                 snapshot.stats.timeline_updates,
                 snapshot.stats.timeline_invalid,
                 snapshot.timeline_valid ? "yes" : "no",
                 snapshot.timeline_msc,
+                snapshot.timeline_opportunity_us,
                 snapshot.timeline_deadline_us,
                 snapshot.timeline_expected_us);
    }
@@ -1121,7 +1127,7 @@ dri3_handle_present_event(struct loader_dri3_drawable *draw,
                 draw->timeline_pending_serial == ce->serial) {
                loader_dri3_pacer_note_timeline(
                   &draw->pacer, draw->timeline_pending_deadline_us,
-                  draw->timeline_pending_expected_us, ce->msc,
+                  draw->timeline_pending_expected_us, ce->ust, ce->msc,
                   os_time_get());
                draw->timeline_pending_serial = 0;
                draw->timeline_pending_deadline_us = 0;

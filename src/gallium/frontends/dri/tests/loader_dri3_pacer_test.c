@@ -219,17 +219,20 @@ test_choreographer_deadline_drives_admission(void)
       loader_dri3_pacer_admit_next(&pacer, admit);
    }
 
-   /* The renderer consumed MSC 8 on an Android opportunity whose readiness
-    * deadline was 1,119,000.  A frame already committed to MSC 9 means the
+   /* The renderer consumed MSC 8 after X selected its contents at 1,100,000.
+    * Android's later readiness deadline is preserved as telemetry but is not
+    * the X selection boundary.  A frame already committed to MSC 9 means the
     * next producer is aimed at MSC 10: two periods after that measured
     * opportunity, less the 12 ms p95 and 1 ms guard. */
-   loader_dri3_pacer_note_timeline(&pacer, 1119000, 1120000, 8, 1117000);
+   loader_dri3_pacer_note_timeline(&pacer, 1119000, 1120000,
+                                   1100000, 8, 1117000);
    assert(loader_dri3_pacer_next_admission(&pacer, 9, 1120000) ==
-          1139334);
+          1120334);
 
    loader_dri3_pacer_snapshot(&pacer, 1120000, &snapshot);
    assert(snapshot.timeline_valid);
    assert(snapshot.timeline_msc == 8);
+   assert(snapshot.timeline_opportunity_us == 1100000);
    assert(snapshot.timeline_deadline_us == 1119000);
    assert(snapshot.timeline_expected_us == 1120000);
    assert(snapshot.stats.timeline_updates == 1);
@@ -239,7 +242,8 @@ test_choreographer_deadline_drives_admission(void)
    assert(snapshot.retained_allocations == 0);
    assert(snapshot.submission_slots_used == 0);
 
-   loader_dri3_pacer_note_timeline(&pacer, 1200000, 1190000, 9, 1180000);
+   loader_dri3_pacer_note_timeline(&pacer, 1200000, 1190000,
+                                   1180000, 9, 1180000);
    assert(pacer.stats.timeline_invalid == 1);
    assert(pacer.last_timeline_msc == 8);
 }

@@ -138,6 +138,7 @@ loader_dri3_pacer_reset_generation(struct loader_dri3_pacer *pacer,
    pacer->last_complete_ust = 0;
    pacer->last_complete_msc = 0;
    pacer->last_complete_local_us = 0;
+   pacer->last_timeline_opportunity_us = 0;
    pacer->last_timeline_deadline_us = 0;
    pacer->last_timeline_expected_us = 0;
    pacer->last_timeline_msc = 0;
@@ -358,16 +359,18 @@ void
 loader_dri3_pacer_note_timeline(struct loader_dri3_pacer *pacer,
                                 uint64_t deadline_us,
                                 uint64_t expected_us,
+                                uint64_t opportunity_us,
                                 uint64_t opportunity_msc,
                                 uint64_t now_us)
 {
-   uint64_t msc_delta, expected_delta, measured_period;
+   uint64_t msc_delta, opportunity_delta, measured_period;
 
    /* Choreographer uses CLOCK_MONOTONIC, as does os_time_get().  Reject a
     * malformed or clearly stale/cross-clock payload before it can move an
     * admission point.  This metadata remains independent from all ownership
     * and producer-fence transitions. */
-   if (!deadline_us || !expected_us || !opportunity_msc ||
+   if (!deadline_us || !expected_us || !opportunity_us || !opportunity_msc ||
+       opportunity_us > deadline_us ||
        expected_us < deadline_us ||
        deadline_us > now_us + 1000000 ||
        (now_us > expected_us && now_us - expected_us > 1000000)) {
@@ -378,21 +381,25 @@ loader_dri3_pacer_note_timeline(struct loader_dri3_pacer *pacer,
    if (pacer->timeline_valid) {
       if (opportunity_msc < pacer->last_timeline_msc ||
           (opportunity_msc == pacer->last_timeline_msc &&
-           (deadline_us != pacer->last_timeline_deadline_us ||
+           (opportunity_us != pacer->last_timeline_opportunity_us ||
+            deadline_us != pacer->last_timeline_deadline_us ||
             expected_us != pacer->last_timeline_expected_us))) {
          pacer->stats.timeline_invalid++;
          return;
       }
 
       msc_delta = opportunity_msc - pacer->last_timeline_msc;
-      if (msc_delta && expected_us > pacer->last_timeline_expected_us) {
-         expected_delta = expected_us - pacer->last_timeline_expected_us;
-         measured_period = expected_delta / msc_delta;
+      if (msc_delta &&
+          opportunity_us > pacer->last_timeline_opportunity_us) {
+         opportunity_delta = opportunity_us -
+                             pacer->last_timeline_opportunity_us;
+         measured_period = opportunity_delta / msc_delta;
          if (measured_period >= 5000 && measured_period <= 50000)
             pacer->period_us = (pacer->period_us * 7 + measured_period) / 8;
       }
    }
 
+   pacer->last_timeline_opportunity_us = opportunity_us;
    pacer->last_timeline_deadline_us = deadline_us;
    pacer->last_timeline_expected_us = expected_us;
    pacer->last_timeline_msc = opportunity_msc;
@@ -620,16 +627,17 @@ loader_dri3_pacer_next_admission(const struct loader_dri3_pacer *pacer,
                                  uint64_t now_us)
 {
    uint64_t production_us, next_target_msc, msc_delta, next_target_ust;
-   uint64_t lead_us, deadline_us;
+   uint64_t lead_us, opportunity_us, admission_us;
 
    production_us = loader_dri3_pacer_production_p95(pacer);
    lead_us = production_us + pacer->margin_us;
 
-   /* Prefer the deadline belonging to the actual Android renderer
-    * opportunity which consumed the preceding root contents.  The submitted
-    * target keeps the permitted two-frame overlap honest: if one later frame
-    * is already committed, production after this swap is aimed at the
-    * following opportunity rather than the one already occupied. */
+   /* Termux:X11 selects X contents at the Choreographer callback, before the
+    * later Android renderer deadline.  Aim producer readiness at that actual
+    * selection opportunity.  The submitted target keeps the permitted
+    * two-frame overlap honest: if one later frame is already committed,
+    * production after this swap is aimed at the following opportunity rather
+    * than the one already occupied. */
    if (pacer->timeline_valid && pacer->production_count >=
                                   LOADER_DRI3_PACER_MIN_SAMPLES &&
        now_us >= pacer->last_timeline_local_us &&
@@ -644,20 +652,21 @@ loader_dri3_pacer_next_admission(const struct loader_dri3_pacer *pacer,
 
       if (msc_delta && msc_delta <= 3 &&
           msc_delta <= UINT64_MAX / pacer->period_us &&
-          pacer->last_timeline_deadline_us <=
+          pacer->last_timeline_opportunity_us <=
              UINT64_MAX - msc_delta * pacer->period_us) {
-         deadline_us = pacer->last_timeline_deadline_us +
-                       msc_delta * pacer->period_us;
+         opportunity_us = pacer->last_timeline_opportunity_us +
+                          msc_delta * pacer->period_us;
 
          /* Missing an opportunity advances phase; it never creates a
           * catch-up burst.  Bound projection to the same short horizon used
           * by the two-frame ledger. */
-         for (unsigned i = 0; deadline_us <= now_us + lead_us && i < 2; i++)
-            deadline_us += pacer->period_us;
+         for (unsigned i = 0;
+              opportunity_us <= now_us + lead_us && i < 2; i++)
+            opportunity_us += pacer->period_us;
 
-         if (deadline_us > lead_us && deadline_us > now_us &&
-             deadline_us - now_us <= pacer->period_us * 3)
-            return deadline_us - lead_us;
+         if (opportunity_us > lead_us && opportunity_us > now_us &&
+             opportunity_us - now_us <= pacer->period_us * 3)
+            return opportunity_us - lead_us;
       }
    }
 
@@ -677,17 +686,17 @@ loader_dri3_pacer_next_admission(const struct loader_dri3_pacer *pacer,
    if (next_target_ust <= lead_us)
       return 0;
 
-   deadline_us = next_target_ust - lead_us;
-   if (deadline_us <= now_us)
+   admission_us = next_target_ust - lead_us;
+   if (admission_us <= now_us)
       return 0;
 
-   /* A deadline more than two refresh periods away is not a useful admission
-    * point for this bounded two-frame pipeline and probably indicates a clock
-    * or generation mismatch. */
-   if (deadline_us - now_us > pacer->period_us * 2)
+   /* An admission point more than two refresh periods away is not useful for
+    * this bounded two-frame pipeline and probably indicates a clock or
+    * generation mismatch. */
+   if (admission_us - now_us > pacer->period_us * 2)
       return 0;
 
-   return deadline_us;
+   return admission_us;
 }
 
 void
@@ -722,6 +731,8 @@ loader_dri3_pacer_snapshot(const struct loader_dri3_pacer *pacer,
    snapshot->submission_actual_p95_us =
       pacer_percentile(pacer->submission_actual_us,
                        pacer->actual_count, 95);
+   snapshot->timeline_opportunity_us =
+      pacer->last_timeline_opportunity_us;
    snapshot->timeline_deadline_us = pacer->last_timeline_deadline_us;
    snapshot->timeline_expected_us = pacer->last_timeline_expected_us;
    snapshot->timeline_msc = pacer->last_timeline_msc;
