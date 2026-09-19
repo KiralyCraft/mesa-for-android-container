@@ -149,7 +149,8 @@ static_assert(sizeof(struct lorie_dri3_ahb_allocation_reply) == 36,
  * special event after our queue check.  The socket is no longer readable in
  * that case, so a single poll lasting until the stale-timeline deadline would
  * miss an event already held by XCB.  Recheck the special queue frequently;
- * ordinary admission pacing normally avoids this wait altogether. */
+ * the opt-in admission-delay experiment normally avoids this wait
+ * altogether. */
 #define DRI3_PRESENT_EVENT_POLL_SLICE_MS 2
 
 static void
@@ -973,7 +974,7 @@ loader_dri3_drawable_init(xcb_connection_t *conn,
    draw->timeline_pending_serial = 0;
    draw->timeline_pending_deadline_us = 0;
    draw->timeline_pending_expected_us = 0;
-   draw->admission_pacing = true;
+   draw->admission_pacing = false;
    draw->pacing_trace = false;
    draw->experimental_consumer_owned_alloc = false;
    loader_dri3_pacer_init(&draw->pacer, os_time_get());
@@ -1016,8 +1017,13 @@ loader_dri3_drawable_init(xcb_connection_t *conn,
       draw->present_mode =
          dri3_parse_present_mode(present_mode_env ? present_mode_env :
                                                     present_mode);
+      /* DEBUG: deadline-based admission remains observation-first.  The
+       * 1080p device trace showed that the current estimator can reduce a
+       * FIFO-sustainable workload from 60 FPS to roughly 58 FPS.  Keep the
+       * bounded Present policy active, but require explicit opt-in until the
+       * admission controller has a validated service-rate/queue model. */
       draw->admission_pacing =
-         debug_get_bool_option("MESA_DRI3_ADMISSION_PACING", true);
+         debug_get_bool_option("MESA_DRI3_ADMISSION_PACING", false);
       draw->pacing_trace =
          debug_get_bool_option("MESA_DRI3_PRESENT_TRACE", false);
       /* DEBUG: paired with TERMUX_X11_EXPERIMENTAL_DIRECT_ALLOC on the
