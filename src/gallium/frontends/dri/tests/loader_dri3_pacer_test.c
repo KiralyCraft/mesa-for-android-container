@@ -21,7 +21,7 @@ finish_frame(struct loader_dri3_pacer *pacer, uint64_t serial,
    loader_dri3_pacer_note_submitted(pacer, serial,
                                     admitted_us + production_us + 100, true);
    assert(pacer->submission_slots_used == 1);
-   assert(loader_dri3_pacer_submission_credit(pacer));
+   assert(!loader_dri3_pacer_submission_credit(pacer));
    loader_dri3_pacer_note_backend_released(
       pacer, (uint32_t) serial, true,
       admitted_us + production_us + 500);
@@ -64,22 +64,21 @@ test_production_and_submission_credits_are_independent(void)
    loader_dri3_pacer_init(&pacer, 1000);
    assert(loader_dri3_pacer_reserve(&pacer, 1, 11, 1000, 1000));
    loader_dri3_pacer_note_submitted(&pacer, 1, 1100, true);
-   assert(loader_dri3_pacer_submission_credit(&pacer));
+   assert(!loader_dri3_pacer_submission_credit(&pacer));
 
    assert(loader_dri3_pacer_production_credit(&pacer));
    assert(loader_dri3_pacer_reserve(&pacer, 2, 0, 1100, 1100));
    loader_dri3_pacer_set_target(&pacer, 2, 12);
    assert(pacer.frames[1].target_msc == 12);
-   loader_dri3_pacer_note_submitted(&pacer, 2, 1200, true);
-   assert(!loader_dri3_pacer_submission_credit(&pacer));
    assert(!loader_dri3_pacer_production_credit(&pacer));
    assert(!loader_dri3_pacer_reserve(&pacer, 3, 13, 1200, 1200));
 
-   loader_dri3_pacer_note_complete(&pacer, 1, 10000, 11, 1300);
-   assert(!loader_dri3_pacer_submission_credit(&pacer));
-   assert(loader_dri3_pacer_production_credit(&pacer));
    loader_dri3_pacer_note_backend_released(&pacer, 1, true, 1350);
    assert(loader_dri3_pacer_submission_credit(&pacer));
+   loader_dri3_pacer_note_submitted(&pacer, 2, 1400, true);
+   assert(!loader_dri3_pacer_submission_credit(&pacer));
+   loader_dri3_pacer_note_complete(&pacer, 1, 10000, 11, 1450);
+   assert(loader_dri3_pacer_production_credit(&pacer));
    assert(pacer.submission_slots_used == 1);
 }
 
@@ -91,13 +90,10 @@ test_legacy_completion_releases_submission_slot(void)
    loader_dri3_pacer_init(&pacer, 1000);
    assert(loader_dri3_pacer_reserve(&pacer, 1, 11, 1000, 1000));
    loader_dri3_pacer_note_submitted(&pacer, 1, 1100, false);
-   assert(loader_dri3_pacer_submission_credit(&pacer));
-   assert(loader_dri3_pacer_reserve(&pacer, 2, 12, 1100, 1100));
-   loader_dri3_pacer_note_submitted(&pacer, 2, 1150, false);
    assert(!loader_dri3_pacer_submission_credit(&pacer));
    loader_dri3_pacer_note_complete(&pacer, 1, 10000, 11, 1200);
    assert(loader_dri3_pacer_submission_credit(&pacer));
-   assert(pacer.submission_slots_used == 1);
+   assert(pacer.submission_slots_used == 0);
    assert(pacer.stats.backend_released == 1);
 }
 

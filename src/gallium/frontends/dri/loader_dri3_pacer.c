@@ -172,9 +172,10 @@ loader_dri3_pacer_reset_generation(struct loader_dri3_pacer *pacer,
 bool
 loader_dri3_pacer_submission_credit(const struct loader_dri3_pacer *pacer)
 {
-   /* One submission may be at the renderer's current consumption boundary
-    * while one later frame is committed to the next display opportunity.
-    * This is still the same two-frame ledger bound, not a second queue. */
+   /* Keep at most one root update submitted but not yet sampled by the
+    * renderer.  The separate production credit still lets the application
+    * render its successor in parallel; only that successor's Present commit
+    * waits for backend consumption. */
    return pacer->submission_slots_used <
           LOADER_DRI3_PACER_MAX_SUBMISSION_SLOTS;
 }

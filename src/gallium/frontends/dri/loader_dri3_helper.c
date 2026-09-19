@@ -1969,11 +1969,12 @@ loader_dri3_swap_buffers_msc(struct loader_dri3_drawable *draw,
    }
 
    /* A paced drawable permits one frame to be produced while its predecessor
-    * is committed to the presentation backend.  The two submission slots
-    * represent the frame at the renderer's current consumption boundary and
-    * at most one commitment for the following opportunity.  Do not turn the
-    * allocation pool into a deeper implicit Present queue: wait for a slot
-    * before committing the frame which was just flushed.
+    * is committed to the presentation backend.  Keep only one unconsumed
+    * root update submitted: a second Present can supersede the first before
+    * Termux:X11's renderer samples it even when their nominal target MSCs are
+    * distinct.  Do not turn the allocation pool into a deeper implicit
+    * Present queue: wait for backend consumption before committing the frame
+    * which was just flushed.
     *
     * The producer work and its native fence worker have already been
     * submitted.  The wait below therefore cannot prevent the dependency from
@@ -2278,11 +2279,10 @@ loader_dri3_swap_buffers_msc(struct loader_dri3_drawable *draw,
       }
 
       /* Reserve production credit before returning control to the
-       * application.  With one current and one future backend submission,
-       * both frame records can briefly remain incomplete even though another
-       * submission slot is available.  Letting the client start a third frame
-       * here would violate the two-frame ledger bound and discover the error
-       * only at its next swap. */
+       * application.  One frame can remain backend-submitted while its
+       * successor is producing.  Letting the client start a third frame here
+       * would violate the two-frame ledger bound and discover the error only
+       * at its next swap. */
       if (paced_present &&
           !loader_dri3_pacer_production_credit(&draw->pacer)) {
          uint64_t production_wait_start_us = os_time_get();
