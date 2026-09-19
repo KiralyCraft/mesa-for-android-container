@@ -73,12 +73,15 @@ test_production_and_submission_credits_are_independent(void)
    assert(!loader_dri3_pacer_production_credit(&pacer));
    assert(!loader_dri3_pacer_reserve(&pacer, 3, 13, 1200, 1200));
 
-   loader_dri3_pacer_note_backend_released(&pacer, 1, true, 1350);
+   loader_dri3_pacer_note_complete(&pacer, 1, 10000, 11, 1300);
    assert(loader_dri3_pacer_submission_credit(&pacer));
-   loader_dri3_pacer_note_submitted(&pacer, 2, 1400, true);
+   assert(pacer.stats.backend_released == 0);
+   loader_dri3_pacer_note_submitted(&pacer, 2, 1350, true);
    assert(!loader_dri3_pacer_submission_credit(&pacer));
-   loader_dri3_pacer_note_complete(&pacer, 1, 10000, 11, 1450);
    assert(loader_dri3_pacer_production_credit(&pacer));
+   loader_dri3_pacer_note_backend_released(&pacer, 1, true, 1400);
+   assert(!loader_dri3_pacer_submission_credit(&pacer));
+   assert(pacer.stats.backend_released == 1);
    assert(pacer.submission_slots_used == 1);
 }
 
@@ -283,13 +286,14 @@ test_lost_timing_preserves_dependencies(void)
    assert(snapshot.retained_allocations == 1);
    assert(snapshot.submission_slots_used == 1);
 
-   /* A timing timeout cancels only scheduling waits.  Backend capacity,
-    * logical completion, and consumer release remain independent. */
+   /* A timing timeout cancels only scheduling waits.  Present selection
+    * releases commitment credit, while backend consumption and consumer
+    * release remain independent. */
    loader_dri3_pacer_note_complete(&pacer, 1, 166670, 10, 105000);
    loader_dri3_pacer_snapshot(&pacer, 105000, &snapshot);
    assert(snapshot.outstanding_frames == 0);
    assert(snapshot.retained_allocations == 1);
-   assert(snapshot.submission_slots_used == 1);
+   assert(snapshot.submission_slots_used == 0);
 
    loader_dri3_pacer_note_backend_released(&pacer, 1, true, 105500);
    assert(loader_dri3_pacer_submission_credit(&pacer));

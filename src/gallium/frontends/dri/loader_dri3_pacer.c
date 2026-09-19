@@ -59,6 +59,18 @@ pacer_alloc_frame(struct loader_dri3_pacer *pacer)
 }
 
 static void
+pacer_release_submission_slot(struct loader_dri3_pacer *pacer,
+                              struct loader_dri3_pacer_frame *frame)
+{
+   if (!frame || !frame->submitted || frame->submission_slot_released)
+      return;
+
+   frame->submission_slot_released = true;
+   if (pacer->submission_slots_used)
+      pacer->submission_slots_used--;
+}
+
+static void
 pacer_expire_actual(struct loader_dri3_pacer *pacer, uint64_t now_us)
 {
    for (unsigned i = 0; i < LOADER_DRI3_PACER_ACTUAL_SLOTS; i++) {
@@ -348,8 +360,7 @@ loader_dri3_pacer_note_backend_released(struct loader_dri3_pacer *pacer,
       return;
 
    frame->backend_released = true;
-   if (pacer->submission_slots_used)
-      pacer->submission_slots_used--;
+   pacer_release_submission_slot(pacer, frame);
    pacer->stats.backend_released++;
    if (!consumed)
       pacer->stats.backend_retired++;
@@ -419,14 +430,15 @@ loader_dri3_pacer_note_complete(struct loader_dri3_pacer *pacer,
    bool current_generation =
       frame && frame->generation == pacer->generation;
 
-   /* Matching servers release the submission slot with a distinct backend
-    * event.  Legacy servers use ordinary Present completion as the exact
-    * fallback boundary for the same credit. */
+   /* Present completion establishes that this future commitment has reached
+    * the X selection boundary, so another Present request may be committed.
+    * It does not establish Android renderer consumption, physical
+    * presentation, or storage release; matching servers report those later
+    * through their independent feedback paths. */
+   pacer_release_submission_slot(pacer, frame);
    if (frame && frame->submitted && !frame->backend_release_expected &&
        !frame->backend_released) {
       frame->backend_released = true;
-      if (pacer->submission_slots_used)
-         pacer->submission_slots_used--;
       pacer->stats.backend_released++;
    }
 

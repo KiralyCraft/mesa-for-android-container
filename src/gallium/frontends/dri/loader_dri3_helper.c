@@ -1973,8 +1973,9 @@ loader_dri3_swap_buffers_msc(struct loader_dri3_drawable *draw,
     * root update submitted: a second Present can supersede the first before
     * Termux:X11's renderer samples it even when their nominal target MSCs are
     * distinct.  Do not turn the allocation pool into a deeper implicit
-    * Present queue: wait for backend consumption before committing the frame
-    * which was just flushed.
+    * Present queue: wait until the preceding request reaches its X selection
+    * boundary before committing the frame which was just flushed.  Android
+    * renderer consumption remains separately tracked by backend feedback.
     *
     * The producer work and its native fence worker have already been
     * submitted.  The wait below therefore cannot prevent the dependency from

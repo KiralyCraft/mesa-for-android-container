@@ -40,6 +40,7 @@ struct loader_dri3_pacer_frame {
    bool reserved;
    bool producer_ready;
    bool submitted;
+   bool submission_slot_released;
    bool backend_release_expected;
    bool backend_released;
    bool residence_sampled;
