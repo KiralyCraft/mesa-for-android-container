@@ -856,6 +856,8 @@ loader_dri3_drawable_fini(struct loader_dri3_drawable *draw)
                 " storage_retention_p95_us=%" PRIu64
                 " commitment_waits=%" PRIu64
                 " commitment_wait_us=%" PRIu64
+                " production_waits=%" PRIu64
+                " production_wait_us=%" PRIu64
                 " admission_waits=%" PRIu64
                 " admission_wait_us=%" PRIu64
                 " submission_slots_used=%u"
@@ -866,6 +868,8 @@ loader_dri3_drawable_fini(struct loader_dri3_drawable *draw)
                 snapshot.storage_retention_p95_us,
                 snapshot.stats.block_count[LOADER_DRI3_PACER_BLOCK_COMMITMENT],
                 snapshot.stats.block_us[LOADER_DRI3_PACER_BLOCK_COMMITMENT],
+                snapshot.stats.block_count[LOADER_DRI3_PACER_BLOCK_PRODUCTION],
+                snapshot.stats.block_us[LOADER_DRI3_PACER_BLOCK_PRODUCTION],
                 snapshot.stats.block_count[LOADER_DRI3_PACER_BLOCK_ADMISSION],
                 snapshot.stats.block_us[LOADER_DRI3_PACER_BLOCK_ADMISSION],
                 snapshot.submission_slots_used,
@@ -2175,6 +2179,44 @@ loader_dri3_swap_buffers_msc(struct loader_dri3_drawable *draw,
             &draw->pacer, LOADER_DRI3_PACER_BLOCK_ADMISSION,
             admitted_us - wait_start_us, admitted_us);
       }
+
+      /* Reserve production credit before returning control to the
+       * application.  With one current and one future backend submission,
+       * both frame records can briefly remain incomplete even though another
+       * submission slot is available.  Letting the client start a third frame
+       * here would violate the two-frame ledger bound and discover the error
+       * only at its next swap. */
+      if (paced_present &&
+          !loader_dri3_pacer_production_credit(&draw->pacer)) {
+         uint64_t production_wait_start_us = os_time_get();
+         int timeout_ms = MAX2(
+            (int) DIV_ROUND_UP(draw->pacer.period_us * 3, 1000), 100);
+         uint64_t wait_deadline_us =
+            production_wait_start_us + timeout_ms * 1000ULL;
+
+         while (!loader_dri3_pacer_production_credit(&draw->pacer)) {
+            int64_t remaining_us = wait_deadline_us - os_time_get();
+            int remaining_ms = remaining_us > 0 ?
+               DIV_ROUND_UP(remaining_us, 1000) : 0;
+
+            if (!remaining_ms ||
+                !dri3_wait_for_event_locked_timeout(draw, remaining_ms)) {
+               loader_dri3_pacer_timing_timeout(&draw->pacer,
+                                                os_time_get());
+               paced_present = false;
+               mesa_loge("DRI3: paced production credit stale for %d ms; "
+                         "temporarily falling back to synchronized unpaced "
+                         "presentation",
+                         timeout_ms);
+               break;
+            }
+         }
+         admitted_us = os_time_get();
+         loader_dri3_pacer_note_block(
+            &draw->pacer, LOADER_DRI3_PACER_BLOCK_PRODUCTION,
+            admitted_us - production_wait_start_us, admitted_us);
+      }
+
       loader_dri3_pacer_admit_next(&draw->pacer, admitted_us);
       mtx_unlock(&draw->mtx);
    }

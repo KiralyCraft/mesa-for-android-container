@@ -77,6 +77,7 @@ test_production_and_submission_credits_are_independent(void)
 
    loader_dri3_pacer_note_complete(&pacer, 1, 10000, 11, 1300);
    assert(!loader_dri3_pacer_submission_credit(&pacer));
+   assert(loader_dri3_pacer_production_credit(&pacer));
    loader_dri3_pacer_note_backend_released(&pacer, 1, true, 1350);
    assert(loader_dri3_pacer_submission_credit(&pacer));
    assert(pacer.submission_slots_used == 1);
