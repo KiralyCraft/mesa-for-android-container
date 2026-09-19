@@ -193,6 +193,12 @@ struct loader_dri3_drawable {
    int swap_interval;
    enum loader_dri3_present_mode present_mode;
    uint32_t present_capabilities;
+   /* Private timeline event and backend-release event are delivered in-order
+    * on the same Present selection.  Keep their timing payload separate from
+    * the ownership ledger until the release supplies its opportunity MSC. */
+   uint32_t timeline_pending_serial;
+   uint64_t timeline_pending_deadline_us;
+   uint64_t timeline_pending_expected_us;
    struct loader_dri3_pacer pacer;
 
    struct loader_dri3_present_sync *present_sync;

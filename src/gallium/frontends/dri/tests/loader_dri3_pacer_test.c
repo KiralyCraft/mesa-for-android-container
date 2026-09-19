@@ -204,6 +204,47 @@ test_timeout_and_recovery(void)
 }
 
 static void
+test_choreographer_deadline_drives_admission(void)
+{
+   struct loader_dri3_pacer pacer;
+   struct loader_dri3_pacer_snapshot snapshot;
+   uint64_t admit = 1000000;
+   uint64_t ust = 1000000;
+
+   loader_dri3_pacer_init(&pacer, admit);
+   for (uint64_t i = 1; i <= 8; i++) {
+      finish_frame(&pacer, i, admit, 4000 + i * 1000, ust, i);
+      admit += 16667;
+      ust += 16667;
+      loader_dri3_pacer_admit_next(&pacer, admit);
+   }
+
+   /* The renderer consumed MSC 8 on an Android opportunity whose readiness
+    * deadline was 1,119,000.  A frame already committed to MSC 9 means the
+    * next producer is aimed at MSC 10: two periods after that measured
+    * opportunity, less the 12 ms p95 and 1 ms guard. */
+   loader_dri3_pacer_note_timeline(&pacer, 1119000, 1120000, 8, 1117000);
+   assert(loader_dri3_pacer_next_admission(&pacer, 9, 1120000) ==
+          1139334);
+
+   loader_dri3_pacer_snapshot(&pacer, 1120000, &snapshot);
+   assert(snapshot.timeline_valid);
+   assert(snapshot.timeline_msc == 8);
+   assert(snapshot.timeline_deadline_us == 1119000);
+   assert(snapshot.timeline_expected_us == 1120000);
+   assert(snapshot.stats.timeline_updates == 1);
+
+   /* Timing metadata cannot establish any ownership transition. */
+   assert(snapshot.outstanding_frames == 0);
+   assert(snapshot.retained_allocations == 0);
+   assert(snapshot.submission_slots_used == 0);
+
+   loader_dri3_pacer_note_timeline(&pacer, 1200000, 1190000, 9, 1180000);
+   assert(pacer.stats.timeline_invalid == 1);
+   assert(pacer.last_timeline_msc == 8);
+}
+
+static void
 test_lost_timing_preserves_dependencies(void)
 {
    struct loader_dri3_pacer pacer;
@@ -376,6 +417,7 @@ main(void)
    test_ready_residence_covers_both_event_orders();
    test_future_submissions_get_distinct_targets();
    test_production_history_and_deadline();
+   test_choreographer_deadline_drives_admission();
    test_timeout_and_recovery();
    test_lost_timing_preserves_dependencies();
    test_generation_reset_and_cancel();

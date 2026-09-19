@@ -83,6 +83,8 @@ struct loader_dri3_pacer_stats {
    uint64_t actual_timeouts;
    uint64_t actual_overflows;
    uint64_t actual_invalid_timestamps;
+   uint64_t timeline_updates;
+   uint64_t timeline_invalid;
    uint64_t block_count[LOADER_DRI3_PACER_BLOCK_REASON_COUNT];
    uint64_t block_us[LOADER_DRI3_PACER_BLOCK_REASON_COUNT];
 };
@@ -95,6 +97,9 @@ struct loader_dri3_pacer_snapshot {
    uint64_t submission_completion_p95_us;
    uint64_t storage_retention_p95_us;
    uint64_t submission_actual_p95_us;
+   uint64_t timeline_deadline_us;
+   uint64_t timeline_expected_us;
+   uint64_t timeline_msc;
    uint32_t outstanding_frames;
    uint32_t submission_slots_used;
    uint32_t retained_allocations;
@@ -103,6 +108,7 @@ struct loader_dri3_pacer_snapshot {
    uint32_t actual_pending;
    bool timing_valid;
    bool timing_timed_out;
+   bool timeline_valid;
 };
 
 struct loader_dri3_pacer {
@@ -124,6 +130,10 @@ struct loader_dri3_pacer {
    uint64_t last_complete_ust;
    uint64_t last_complete_msc;
    uint64_t last_complete_local_us;
+   uint64_t last_timeline_deadline_us;
+   uint64_t last_timeline_expected_us;
+   uint64_t last_timeline_msc;
+   uint64_t last_timeline_local_us;
    uint32_t production_head;
    uint32_t production_count;
    uint32_t residence_head;
@@ -142,6 +152,7 @@ struct loader_dri3_pacer {
    bool timing_valid;
    bool timing_timed_out;
    bool generation_needs_current_completion;
+   bool timeline_valid;
 };
 
 void
@@ -183,6 +194,15 @@ void
 loader_dri3_pacer_note_backend_released(struct loader_dri3_pacer *pacer,
                                         uint32_t serial, bool consumed,
                                         uint64_t now_us);
+
+/* Record API-33 platform scheduling metadata.  This is timing-only: it never
+ * proves producer completion, backend consumption, or allocation release. */
+void
+loader_dri3_pacer_note_timeline(struct loader_dri3_pacer *pacer,
+                                uint64_t deadline_us,
+                                uint64_t expected_us,
+                                uint64_t opportunity_msc,
+                                uint64_t now_us);
 
 bool
 loader_dri3_pacer_note_complete(struct loader_dri3_pacer *pacer,

@@ -101,12 +101,19 @@ enum dri3_present_wait_status {
 #define LORIE_PRESENT_CAP_WAIT_FENCE_REQUEUE_SAFE (1u << 29)
 #define LORIE_PRESENT_CAP_VBLANK_COMPLETE         (1u << 30)
 #define LORIE_PRESENT_CAP_FRAME_TIMELINE          (1u << 31)
+/* Newer matching servers attach the API-33 Choreographer timing payload to
+ * private backend-release events.  Keep a distinct capability so an older
+ * experimental server which only drives fake MSC from Choreographer cannot
+ * be mistaken for a deadline publisher. */
+#define LORIE_PRESENT_CAP_TIMELINE_NOTIFY          (1u << 26)
 #define LORIE_PRESENT_OPTION_BACKEND_RELEASE      (1u << 30)
 #define LORIE_PRESENT_OPTION_ACTUAL_FEEDBACK      (1u << 31)
 #define LORIE_PRESENT_COMPLETE_KIND_ACTUAL        2
 #define LORIE_PRESENT_COMPLETE_KIND_BACKEND_RELEASE 3
+#define LORIE_PRESENT_COMPLETE_KIND_TIMELINE      4
 #define LORIE_PRESENT_COMPLETE_MODE_ACTUAL        1
 #define LORIE_PRESENT_COMPLETE_MODE_UNKNOWN       2
+#define LORIE_PRESENT_TIMELINE_MODE_EXACT         1
 #define LORIE_PRESENT_BACKEND_RELEASE_CONSUMED    1
 #define LORIE_PRESENT_BACKEND_RELEASE_RETIRED     2
 
@@ -482,7 +489,8 @@ dri3_pacing_supported(const struct loader_dri3_drawable *draw)
 {
    const uint32_t required = LORIE_PRESENT_CAP_WAIT_FENCE_REQUEUE_SAFE |
                              LORIE_PRESENT_CAP_VBLANK_COMPLETE |
-                             LORIE_PRESENT_CAP_FRAME_TIMELINE;
+                             LORIE_PRESENT_CAP_FRAME_TIMELINE |
+                             LORIE_PRESENT_CAP_TIMELINE_NOTIFY;
 
    return draw->present_mode != LOADER_DRI3_PRESENT_UNPACED &&
           !draw->pacer.timing_timed_out &&
@@ -892,6 +900,17 @@ loader_dri3_drawable_fini(struct loader_dri3_drawable *draw)
                 snapshot.stats.actual_invalid_timestamps,
                 snapshot.actual_pending,
                 snapshot.submission_actual_p95_us);
+      mesa_logi("DRI3 pacing: timeline_updates=%" PRIu64
+                " timeline_invalid=%" PRIu64
+                " timeline_valid=%s timeline_msc=%" PRIu64
+                " timeline_deadline_us=%" PRIu64
+                " timeline_expected_us=%" PRIu64,
+                snapshot.stats.timeline_updates,
+                snapshot.stats.timeline_invalid,
+                snapshot.timeline_valid ? "yes" : "no",
+                snapshot.timeline_msc,
+                snapshot.timeline_deadline_us,
+                snapshot.timeline_expected_us);
    }
 
    driDestroyDrawable(draw->dri_drawable);
@@ -945,6 +964,9 @@ loader_dri3_drawable_init(xcb_connection_t *conn,
    draw->present_sync = NULL;
    draw->present_mode = LOADER_DRI3_PRESENT_UNPACED;
    draw->present_capabilities = 0;
+   draw->timeline_pending_serial = 0;
+   draw->timeline_pending_deadline_us = 0;
+   draw->timeline_pending_expected_us = 0;
    draw->admission_pacing = true;
    draw->pacing_trace = false;
    draw->experimental_consumer_owned_alloc = false;
@@ -1062,8 +1084,12 @@ dri3_handle_present_event(struct loader_dri3_drawable *draw,
 
       draw->width = ce->width;
       draw->height = ce->height;
-      if (size_changed)
+      if (size_changed) {
          loader_dri3_pacer_reset_generation(&draw->pacer, os_time_get());
+         draw->timeline_pending_serial = 0;
+         draw->timeline_pending_deadline_us = 0;
+         draw->timeline_pending_expected_us = 0;
+      }
       draw->vtable->set_drawable_size(draw, draw->width, draw->height);
       dri_invalidate_drawable(draw->dri_drawable);
       break;
@@ -1071,12 +1097,36 @@ dri3_handle_present_event(struct loader_dri3_drawable *draw,
    case XCB_PRESENT_EVENT_COMPLETE_NOTIFY: {
       xcb_present_complete_notify_event_t *ce = (void *) ge;
 
+      if (ce->kind == LORIE_PRESENT_COMPLETE_KIND_TIMELINE) {
+         if ((draw->present_capabilities &
+              LORIE_PRESENT_CAP_TIMELINE_NOTIFY) &&
+             ce->event == draw->eid &&
+             ce->mode == LORIE_PRESENT_TIMELINE_MODE_EXACT) {
+            draw->timeline_pending_serial = ce->serial;
+            draw->timeline_pending_deadline_us = ce->ust;
+            draw->timeline_pending_expected_us = ce->msc;
+         }
+         break;
+      }
+
       if (ce->kind == LORIE_PRESENT_COMPLETE_KIND_BACKEND_RELEASE) {
          if ((draw->present_capabilities &
               LORIE_PRESENT_CAP_BACKEND_RELEASE) &&
              ce->event == draw->eid &&
              (ce->mode == LORIE_PRESENT_BACKEND_RELEASE_CONSUMED ||
               ce->mode == LORIE_PRESENT_BACKEND_RELEASE_RETIRED)) {
+            if (ce->mode == LORIE_PRESENT_BACKEND_RELEASE_CONSUMED &&
+                (draw->present_capabilities &
+                 LORIE_PRESENT_CAP_TIMELINE_NOTIFY) &&
+                draw->timeline_pending_serial == ce->serial) {
+               loader_dri3_pacer_note_timeline(
+                  &draw->pacer, draw->timeline_pending_deadline_us,
+                  draw->timeline_pending_expected_us, ce->msc,
+                  os_time_get());
+               draw->timeline_pending_serial = 0;
+               draw->timeline_pending_deadline_us = 0;
+               draw->timeline_pending_expected_us = 0;
+            }
             loader_dri3_pacer_note_backend_released(
                &draw->pacer, ce->serial,
                ce->mode == LORIE_PRESENT_BACKEND_RELEASE_CONSUMED,

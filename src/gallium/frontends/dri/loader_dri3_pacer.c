@@ -138,6 +138,10 @@ loader_dri3_pacer_reset_generation(struct loader_dri3_pacer *pacer,
    pacer->last_complete_ust = 0;
    pacer->last_complete_msc = 0;
    pacer->last_complete_local_us = 0;
+   pacer->last_timeline_deadline_us = 0;
+   pacer->last_timeline_expected_us = 0;
+   pacer->last_timeline_msc = 0;
+   pacer->last_timeline_local_us = 0;
    pacer->production_head = 0;
    pacer->production_count = 0;
    pacer->residence_head = 0;
@@ -150,6 +154,7 @@ loader_dri3_pacer_reset_generation(struct loader_dri3_pacer *pacer,
    pacer->actual_count = 0;
    pacer->timing_valid = false;
    pacer->timing_timed_out = false;
+   pacer->timeline_valid = false;
    pacer->generation_needs_current_completion = true;
    memset(pacer->production_us, 0, sizeof(pacer->production_us));
    memset(pacer->ready_residence_us, 0, sizeof(pacer->ready_residence_us));
@@ -347,6 +352,53 @@ loader_dri3_pacer_note_backend_released(struct loader_dri3_pacer *pacer,
    if (!consumed)
       pacer->stats.backend_retired++;
    pacer_observe(pacer, LOADER_DRI3_PACER_BLOCK_COMMITMENT, now_us);
+}
+
+void
+loader_dri3_pacer_note_timeline(struct loader_dri3_pacer *pacer,
+                                uint64_t deadline_us,
+                                uint64_t expected_us,
+                                uint64_t opportunity_msc,
+                                uint64_t now_us)
+{
+   uint64_t msc_delta, expected_delta, measured_period;
+
+   /* Choreographer uses CLOCK_MONOTONIC, as does os_time_get().  Reject a
+    * malformed or clearly stale/cross-clock payload before it can move an
+    * admission point.  This metadata remains independent from all ownership
+    * and producer-fence transitions. */
+   if (!deadline_us || !expected_us || !opportunity_msc ||
+       expected_us < deadline_us ||
+       deadline_us > now_us + 1000000 ||
+       (now_us > expected_us && now_us - expected_us > 1000000)) {
+      pacer->stats.timeline_invalid++;
+      return;
+   }
+
+   if (pacer->timeline_valid) {
+      if (opportunity_msc < pacer->last_timeline_msc ||
+          (opportunity_msc == pacer->last_timeline_msc &&
+           (deadline_us != pacer->last_timeline_deadline_us ||
+            expected_us != pacer->last_timeline_expected_us))) {
+         pacer->stats.timeline_invalid++;
+         return;
+      }
+
+      msc_delta = opportunity_msc - pacer->last_timeline_msc;
+      if (msc_delta && expected_us > pacer->last_timeline_expected_us) {
+         expected_delta = expected_us - pacer->last_timeline_expected_us;
+         measured_period = expected_delta / msc_delta;
+         if (measured_period >= 5000 && measured_period <= 50000)
+            pacer->period_us = (pacer->period_us * 7 + measured_period) / 8;
+      }
+   }
+
+   pacer->last_timeline_deadline_us = deadline_us;
+   pacer->last_timeline_expected_us = expected_us;
+   pacer->last_timeline_msc = opportunity_msc;
+   pacer->last_timeline_local_us = now_us;
+   pacer->timeline_valid = true;
+   pacer->stats.timeline_updates++;
 }
 
 bool
@@ -570,13 +622,51 @@ loader_dri3_pacer_next_admission(const struct loader_dri3_pacer *pacer,
    uint64_t production_us, next_target_msc, msc_delta, next_target_ust;
    uint64_t lead_us, deadline_us;
 
+   production_us = loader_dri3_pacer_production_p95(pacer);
+   lead_us = production_us + pacer->margin_us;
+
+   /* Prefer the deadline belonging to the actual Android renderer
+    * opportunity which consumed the preceding root contents.  The submitted
+    * target keeps the permitted two-frame overlap honest: if one later frame
+    * is already committed, production after this swap is aimed at the
+    * following opportunity rather than the one already occupied. */
+   if (pacer->timeline_valid && pacer->production_count >=
+                                  LOADER_DRI3_PACER_MIN_SAMPLES &&
+       now_us >= pacer->last_timeline_local_us &&
+       now_us - pacer->last_timeline_local_us <=
+          (pacer->period_us * 3 > 100000 ?
+             pacer->period_us * 3 : 100000)) {
+      next_target_msc = submitted_target_msc == UINT64_MAX ?
+                        UINT64_MAX : submitted_target_msc + 1;
+      if (next_target_msc <= pacer->last_timeline_msc)
+         next_target_msc = pacer->last_timeline_msc + 1;
+      msc_delta = next_target_msc - pacer->last_timeline_msc;
+
+      if (msc_delta && msc_delta <= 3 &&
+          msc_delta <= UINT64_MAX / pacer->period_us &&
+          pacer->last_timeline_deadline_us <=
+             UINT64_MAX - msc_delta * pacer->period_us) {
+         deadline_us = pacer->last_timeline_deadline_us +
+                       msc_delta * pacer->period_us;
+
+         /* Missing an opportunity advances phase; it never creates a
+          * catch-up burst.  Bound projection to the same short horizon used
+          * by the two-frame ledger. */
+         for (unsigned i = 0; deadline_us <= now_us + lead_us && i < 2; i++)
+            deadline_us += pacer->period_us;
+
+         if (deadline_us > lead_us && deadline_us > now_us &&
+             deadline_us - now_us <= pacer->period_us * 3)
+            return deadline_us - lead_us;
+      }
+   }
+
    if (!pacer->timing_valid || pacer->timing_timed_out ||
        pacer->production_count < LOADER_DRI3_PACER_MIN_SAMPLES ||
        !pacer->last_complete_ust ||
        submitted_target_msc < pacer->last_complete_msc)
       return 0;
 
-   production_us = loader_dri3_pacer_production_p95(pacer);
    next_target_msc = submitted_target_msc + 1;
    msc_delta = next_target_msc - pacer->last_complete_msc;
    if (!msc_delta || msc_delta > 3 ||
@@ -584,7 +674,6 @@ loader_dri3_pacer_next_admission(const struct loader_dri3_pacer *pacer,
       return 0;
 
    next_target_ust = pacer->last_complete_ust + msc_delta * pacer->period_us;
-   lead_us = production_us + pacer->margin_us;
    if (next_target_ust <= lead_us)
       return 0;
 
@@ -633,11 +722,15 @@ loader_dri3_pacer_snapshot(const struct loader_dri3_pacer *pacer,
    snapshot->submission_actual_p95_us =
       pacer_percentile(pacer->submission_actual_us,
                        pacer->actual_count, 95);
+   snapshot->timeline_deadline_us = pacer->last_timeline_deadline_us;
+   snapshot->timeline_expected_us = pacer->last_timeline_expected_us;
+   snapshot->timeline_msc = pacer->last_timeline_msc;
    snapshot->outstanding_frames = pacer->outstanding_frames;
    snapshot->submission_slots_used = pacer->submission_slots_used;
    snapshot->retained_allocations = pacer->retained_allocations;
    snapshot->timing_valid = pacer->timing_valid;
    snapshot->timing_timed_out = pacer->timing_timed_out;
+   snapshot->timeline_valid = pacer->timeline_valid;
 
    for (unsigned i = 0; i < LOADER_DRI3_PACER_ACTUAL_SLOTS; i++) {
       if (pacer->actual_frames[i].pending)
