@@ -47,7 +47,8 @@ pacer_alloc_frame(struct loader_dri3_pacer *pacer)
 
       if (!frame->reserved ||
           ((frame->completed || frame->cancelled) &&
-           frame->storage_released))
+           frame->storage_released &&
+           (!frame->submitted || frame->backend_released)))
          return frame;
    }
 
@@ -165,7 +166,7 @@ loader_dri3_pacer_reset_generation(struct loader_dri3_pacer *pacer,
 bool
 loader_dri3_pacer_submission_credit(const struct loader_dri3_pacer *pacer)
 {
-   return pacer->outstanding_frames == 0;
+   return pacer->submission_slots_used == 0;
 }
 
 bool
@@ -262,7 +263,8 @@ loader_dri3_pacer_note_producer_ready(struct loader_dri3_pacer *pacer,
 
 void
 loader_dri3_pacer_note_submitted(struct loader_dri3_pacer *pacer,
-                                 uint64_t serial, uint64_t now_us)
+                                 uint64_t serial, uint64_t now_us,
+                                 bool backend_release_expected)
 {
    struct loader_dri3_pacer_frame *frame = pacer_find_frame(pacer, serial);
 
@@ -270,8 +272,10 @@ loader_dri3_pacer_note_submitted(struct loader_dri3_pacer *pacer,
       return;
 
    frame->submitted = true;
+   frame->backend_release_expected = backend_release_expected;
    frame->submitted_us = now_us;
    pacer->outstanding_frames++;
+   pacer->submission_slots_used++;
    pacer->retained_allocations++;
    pacer->stats.submitted++;
    if (frame->generation == pacer->generation && frame->producer_ready &&
@@ -285,6 +289,36 @@ loader_dri3_pacer_note_submitted(struct loader_dri3_pacer *pacer,
    pacer_observe(pacer, LOADER_DRI3_PACER_BLOCK_COMMITMENT, now_us);
 }
 
+void
+loader_dri3_pacer_note_backend_released(struct loader_dri3_pacer *pacer,
+                                        uint32_t serial, bool consumed,
+                                        uint64_t now_us)
+{
+   struct loader_dri3_pacer_frame *frame = NULL;
+
+   for (unsigned i = 0; i < LOADER_DRI3_PACER_FRAME_SLOTS; i++) {
+      struct loader_dri3_pacer_frame *candidate = &pacer->frames[i];
+
+      if (candidate->reserved && candidate->submitted &&
+          !candidate->backend_released &&
+          (uint32_t) candidate->serial == serial) {
+         frame = candidate;
+         break;
+      }
+   }
+
+   if (!frame)
+      return;
+
+   frame->backend_released = true;
+   if (pacer->submission_slots_used)
+      pacer->submission_slots_used--;
+   pacer->stats.backend_released++;
+   if (!consumed)
+      pacer->stats.backend_retired++;
+   pacer_observe(pacer, LOADER_DRI3_PACER_BLOCK_COMMITMENT, now_us);
+}
+
 bool
 loader_dri3_pacer_note_complete(struct loader_dri3_pacer *pacer,
                                 uint64_t serial, uint64_t ust,
@@ -295,6 +329,17 @@ loader_dri3_pacer_note_complete(struct loader_dri3_pacer *pacer,
    bool current_generation =
       frame && frame->generation == pacer->generation;
 
+   /* Matching servers release the submission slot with a distinct backend
+    * event.  Legacy servers use ordinary Present completion as the exact
+    * fallback boundary for the same credit. */
+   if (frame && frame->submitted && !frame->backend_release_expected &&
+       !frame->backend_released) {
+      frame->backend_released = true;
+      if (pacer->submission_slots_used)
+         pacer->submission_slots_used--;
+      pacer->stats.backend_released++;
+   }
+
    if ((!pacer->generation_needs_current_completion || current_generation) &&
        pacer->last_complete_ust && ust > pacer->last_complete_ust &&
        msc > pacer->last_complete_msc) {
@@ -303,9 +348,11 @@ loader_dri3_pacer_note_complete(struct loader_dri3_pacer *pacer,
 
       if (sample >= 4000 && sample <= 100000) {
          pacer->period_us = (pacer->period_us * 7 + sample) / 8;
-         recovered = pacer->timing_timed_out;
+         recovered = pacer->timing_timed_out &&
+                     pacer->submission_slots_used == 0;
          pacer->timing_valid = true;
-         pacer->timing_timed_out = false;
+         if (pacer->submission_slots_used == 0)
+            pacer->timing_timed_out = false;
       }
    }
 
@@ -557,6 +604,7 @@ loader_dri3_pacer_snapshot(const struct loader_dri3_pacer *pacer,
       pacer_percentile(pacer->submission_actual_us,
                        pacer->actual_count, 95);
    snapshot->outstanding_frames = pacer->outstanding_frames;
+   snapshot->submission_slots_used = pacer->submission_slots_used;
    snapshot->retained_allocations = pacer->retained_allocations;
    snapshot->timing_valid = pacer->timing_valid;
    snapshot->timing_timed_out = pacer->timing_timed_out;

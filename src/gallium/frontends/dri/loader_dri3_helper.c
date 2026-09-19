@@ -96,14 +96,19 @@ enum dri3_present_wait_status {
 #define DRI3_PRESENT_WAIT_FENCE_FAILED ((xcb_sync_fence_t) UINT32_MAX)
 
 /* Private Termux:X11 Present capability bits. */
+#define LORIE_PRESENT_CAP_BACKEND_RELEASE         (1u << 27)
 #define LORIE_PRESENT_CAP_ACTUAL_FEEDBACK         (1u << 28)
 #define LORIE_PRESENT_CAP_WAIT_FENCE_REQUEUE_SAFE (1u << 29)
 #define LORIE_PRESENT_CAP_VBLANK_COMPLETE         (1u << 30)
 #define LORIE_PRESENT_CAP_FRAME_TIMELINE          (1u << 31)
+#define LORIE_PRESENT_OPTION_BACKEND_RELEASE      (1u << 30)
 #define LORIE_PRESENT_OPTION_ACTUAL_FEEDBACK      (1u << 31)
 #define LORIE_PRESENT_COMPLETE_KIND_ACTUAL        2
+#define LORIE_PRESENT_COMPLETE_KIND_BACKEND_RELEASE 3
 #define LORIE_PRESENT_COMPLETE_MODE_ACTUAL        1
 #define LORIE_PRESENT_COMPLETE_MODE_UNKNOWN       2
+#define LORIE_PRESENT_BACKEND_RELEASE_CONSUMED    1
+#define LORIE_PRESENT_BACKEND_RELEASE_RETIRED     2
 
 /* DEBUG: private reverse-allocation handshake with the matching Termux:X11
  * development server.  The pseudo modifier is deliberately not advertised
@@ -833,11 +838,14 @@ loader_dri3_drawable_fini(struct loader_dri3_drawable *draw)
       loader_dri3_pacer_snapshot(&draw->pacer, os_time_get(), &snapshot);
       mesa_logi("DRI3 pacing: admission_delay=%s admitted=%" PRIu64
                 " ready=%" PRIu64 " submitted=%" PRIu64
+                " backend_released=%" PRIu64
+                " backend_retired=%" PRIu64
                 " completed=%" PRIu64 " released=%" PRIu64
                 " late=%" PRIu64 " ledger_overflows=%" PRIu64,
                 draw->admission_pacing ? "enabled" : "disabled",
                 snapshot.stats.admitted, snapshot.stats.producer_ready,
-                snapshot.stats.submitted, snapshot.stats.completed,
+                snapshot.stats.submitted, snapshot.stats.backend_released,
+                snapshot.stats.backend_retired, snapshot.stats.completed,
                 snapshot.stats.storage_released,
                 snapshot.stats.late_completions,
                 snapshot.stats.ledger_overflows);
@@ -850,6 +858,7 @@ loader_dri3_drawable_fini(struct loader_dri3_drawable *draw)
                 " commitment_wait_us=%" PRIu64
                 " admission_waits=%" PRIu64
                 " admission_wait_us=%" PRIu64
+                " submission_slots_used=%u"
                 " window_outstanding=%u window_retained=%u",
                 snapshot.period_us, snapshot.production_p95_us,
                 snapshot.ready_residence_p95_us,
@@ -859,6 +868,7 @@ loader_dri3_drawable_fini(struct loader_dri3_drawable *draw)
                 snapshot.stats.block_us[LOADER_DRI3_PACER_BLOCK_COMMITMENT],
                 snapshot.stats.block_count[LOADER_DRI3_PACER_BLOCK_ADMISSION],
                 snapshot.stats.block_us[LOADER_DRI3_PACER_BLOCK_ADMISSION],
+                snapshot.submission_slots_used,
                 snapshot.window_max_outstanding,
                 snapshot.window_max_retained);
       mesa_logi("DRI3 pacing: actual_expected=%" PRIu64
@@ -1056,6 +1066,20 @@ dri3_handle_present_event(struct loader_dri3_drawable *draw,
    }
    case XCB_PRESENT_EVENT_COMPLETE_NOTIFY: {
       xcb_present_complete_notify_event_t *ce = (void *) ge;
+
+      if (ce->kind == LORIE_PRESENT_COMPLETE_KIND_BACKEND_RELEASE) {
+         if ((draw->present_capabilities &
+              LORIE_PRESENT_CAP_BACKEND_RELEASE) &&
+             ce->event == draw->eid &&
+             (ce->mode == LORIE_PRESENT_BACKEND_RELEASE_CONSUMED ||
+              ce->mode == LORIE_PRESENT_BACKEND_RELEASE_RETIRED)) {
+            loader_dri3_pacer_note_backend_released(
+               &draw->pacer, ce->serial,
+               ce->mode == LORIE_PRESENT_BACKEND_RELEASE_CONSUMED,
+               os_time_get());
+         }
+         break;
+      }
 
       if (ce->kind == LORIE_PRESENT_COMPLETE_KIND_ACTUAL) {
          if ((draw->present_capabilities &
@@ -1855,14 +1879,15 @@ loader_dri3_swap_buffers_msc(struct loader_dri3_drawable *draw,
     * PR96 X wait-fence bridge.  A timing timeout only disables pacing; it
     * never removes the producer dependency.
     */
-   if (paced_present && draw->recv_sbc != draw->send_sbc) {
+   if (paced_present &&
+       !loader_dri3_pacer_submission_credit(&draw->pacer)) {
       uint64_t wait_start_us = os_time_get();
       int timeout_ms = MAX2((int) DIV_ROUND_UP(draw->pacer.period_us * 3,
                                                1000),
                             100);
       uint64_t wait_deadline_us = wait_start_us + timeout_ms * 1000ULL;
 
-      while (draw->recv_sbc != draw->send_sbc) {
+      while (!loader_dri3_pacer_submission_credit(&draw->pacer)) {
          int64_t remaining_us = wait_deadline_us - os_time_get();
          int remaining_ms = remaining_us > 0 ?
             DIV_ROUND_UP(remaining_us, 1000) : 0;
@@ -1976,6 +2001,10 @@ loader_dri3_swap_buffers_msc(struct loader_dri3_drawable *draw,
          options |= XCB_PRESENT_OPTION_ASYNC;
       if (paced_present &&
           (draw->present_capabilities &
+           LORIE_PRESENT_CAP_BACKEND_RELEASE))
+         options |= LORIE_PRESENT_OPTION_BACKEND_RELEASE;
+      if (paced_present &&
+          (draw->present_capabilities &
            LORIE_PRESENT_CAP_ACTUAL_FEEDBACK))
          options |= LORIE_PRESENT_OPTION_ACTUAL_FEEDBACK;
 
@@ -2032,7 +2061,9 @@ loader_dri3_swap_buffers_msc(struct loader_dri3_drawable *draw,
 
          dri3_record_present_wait_ready(draw, back);
          loader_dri3_pacer_note_submitted(&draw->pacer, submitted_serial,
-                                          submitted_us);
+                                          submitted_us,
+                                          options &
+                                             LORIE_PRESENT_OPTION_BACKEND_RELEASE);
          if (options & LORIE_PRESENT_OPTION_ACTUAL_FEEDBACK)
             loader_dri3_pacer_expect_actual(&draw->pacer,
                                             submitted_serial,

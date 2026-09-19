@@ -19,11 +19,14 @@ finish_frame(struct loader_dri3_pacer *pacer, uint64_t serial,
    loader_dri3_pacer_note_producer_ready(pacer, serial,
                                          admitted_us + production_us);
    loader_dri3_pacer_note_submitted(pacer, serial,
-                                    admitted_us + production_us + 100);
+                                    admitted_us + production_us + 100, true);
    assert(!loader_dri3_pacer_submission_credit(pacer));
+   loader_dri3_pacer_note_backend_released(
+      pacer, (uint32_t) serial, true,
+      admitted_us + production_us + 500);
+   assert(loader_dri3_pacer_submission_credit(pacer));
    loader_dri3_pacer_note_complete(pacer, serial, ust, msc,
                                    admitted_us + production_us + 1000);
-   assert(loader_dri3_pacer_submission_credit(pacer));
    loader_dri3_pacer_note_storage_released(pacer, serial,
                                            admitted_us + production_us + 2000);
 }
@@ -36,7 +39,8 @@ test_independent_lifetimes(void)
 
    loader_dri3_pacer_init(&pacer, 1000);
    assert(loader_dri3_pacer_reserve(&pacer, 1, 11, 1000, 1100));
-   loader_dri3_pacer_note_submitted(&pacer, 1, 1200);
+   loader_dri3_pacer_note_submitted(&pacer, 1, 1200, true);
+   loader_dri3_pacer_note_backend_released(&pacer, 1, true, 1250);
    loader_dri3_pacer_note_complete(&pacer, 1, 10000, 11, 1300);
    loader_dri3_pacer_snapshot(&pacer, 1300, &snapshot);
    assert(snapshot.outstanding_frames == 0);
@@ -58,7 +62,7 @@ test_production_and_submission_credits_are_independent(void)
 
    loader_dri3_pacer_init(&pacer, 1000);
    assert(loader_dri3_pacer_reserve(&pacer, 1, 11, 1000, 1000));
-   loader_dri3_pacer_note_submitted(&pacer, 1, 1100);
+   loader_dri3_pacer_note_submitted(&pacer, 1, 1100, true);
    assert(!loader_dri3_pacer_submission_credit(&pacer));
 
    assert(loader_dri3_pacer_production_credit(&pacer));
@@ -69,8 +73,24 @@ test_production_and_submission_credits_are_independent(void)
    assert(!loader_dri3_pacer_reserve(&pacer, 3, 13, 1200, 1200));
 
    loader_dri3_pacer_note_complete(&pacer, 1, 10000, 11, 1300);
+   assert(!loader_dri3_pacer_submission_credit(&pacer));
+   loader_dri3_pacer_note_backend_released(&pacer, 1, true, 1350);
    assert(loader_dri3_pacer_submission_credit(&pacer));
-   loader_dri3_pacer_note_submitted(&pacer, 2, 1400);
+   loader_dri3_pacer_note_submitted(&pacer, 2, 1400, true);
+}
+
+static void
+test_legacy_completion_releases_submission_slot(void)
+{
+   struct loader_dri3_pacer pacer;
+
+   loader_dri3_pacer_init(&pacer, 1000);
+   assert(loader_dri3_pacer_reserve(&pacer, 1, 11, 1000, 1000));
+   loader_dri3_pacer_note_submitted(&pacer, 1, 1100, false);
+   assert(!loader_dri3_pacer_submission_credit(&pacer));
+   loader_dri3_pacer_note_complete(&pacer, 1, 10000, 11, 1200);
+   assert(loader_dri3_pacer_submission_credit(&pacer));
+   assert(pacer.stats.backend_released == 1);
 }
 
 static void
@@ -82,15 +102,16 @@ test_ready_residence_covers_both_event_orders(void)
 
    assert(loader_dri3_pacer_reserve(&pacer, 1, 11, 1000, 1000));
    loader_dri3_pacer_note_producer_ready(&pacer, 1, 1200);
-   loader_dri3_pacer_note_submitted(&pacer, 1, 1500);
+   loader_dri3_pacer_note_submitted(&pacer, 1, 1500, true);
    assert(pacer.residence_count == 1);
    assert(pacer.ready_residence_us[0] == 300);
    assert(pacer.frames[0].residence_sampled);
    loader_dri3_pacer_note_complete(&pacer, 1, 10000, 11, 1600);
+   loader_dri3_pacer_note_backend_released(&pacer, 1, true, 1650);
    loader_dri3_pacer_note_storage_released(&pacer, 1, 1700);
 
    assert(loader_dri3_pacer_reserve(&pacer, 2, 12, 1800, 1800));
-   loader_dri3_pacer_note_submitted(&pacer, 2, 1900);
+   loader_dri3_pacer_note_submitted(&pacer, 2, 1900, true);
    assert(pacer.residence_count == 1);
    loader_dri3_pacer_note_producer_ready(&pacer, 2, 2200);
    assert(pacer.residence_count == 2);
@@ -100,7 +121,7 @@ test_ready_residence_covers_both_event_orders(void)
 
    /* Repeated notifications must not contribute duplicate samples. */
    loader_dri3_pacer_note_producer_ready(&pacer, 2, 2300);
-   loader_dri3_pacer_note_submitted(&pacer, 2, 2300);
+   loader_dri3_pacer_note_submitted(&pacer, 2, 2300, true);
    assert(pacer.residence_count == 2);
 }
 
@@ -162,7 +183,7 @@ test_lost_timing_preserves_dependencies(void)
    loader_dri3_pacer_init(&pacer, 1000);
    assert(loader_dri3_pacer_reserve(&pacer, 1, 10, 1000, 1000));
    loader_dri3_pacer_note_producer_ready(&pacer, 1, 4000);
-   loader_dri3_pacer_note_submitted(&pacer, 1, 4100);
+   loader_dri3_pacer_note_submitted(&pacer, 1, 4100, true);
 
    loader_dri3_pacer_timing_timeout(&pacer, 104100);
    loader_dri3_pacer_snapshot(&pacer, 104100, &snapshot);
@@ -171,13 +192,16 @@ test_lost_timing_preserves_dependencies(void)
    assert(snapshot.retained_allocations == 1);
    assert(!loader_dri3_pacer_submission_credit(&pacer));
 
-   /* A timing timeout cancels only scheduling waits.  The actual completion
-    * and consumer release remain the only events which release their credits. */
+   /* A timing timeout cancels only scheduling waits.  Backend capacity,
+    * logical completion, and consumer release remain independent. */
    loader_dri3_pacer_note_complete(&pacer, 1, 166670, 10, 105000);
-   assert(loader_dri3_pacer_submission_credit(&pacer));
+   assert(!loader_dri3_pacer_submission_credit(&pacer));
    loader_dri3_pacer_snapshot(&pacer, 105000, &snapshot);
    assert(snapshot.outstanding_frames == 0);
    assert(snapshot.retained_allocations == 1);
+
+   loader_dri3_pacer_note_backend_released(&pacer, 1, true, 105500);
+   assert(loader_dri3_pacer_submission_credit(&pacer));
 
    loader_dri3_pacer_note_storage_released(&pacer, 1, 106000);
    loader_dri3_pacer_snapshot(&pacer, 106000, &snapshot);
@@ -215,12 +239,13 @@ test_old_generation_feedback_does_not_seed_timeline(void)
 
    loader_dri3_pacer_init(&pacer, 1000);
    assert(loader_dri3_pacer_reserve(&pacer, 1, 2, 1000, 1100));
-   loader_dri3_pacer_note_submitted(&pacer, 1, 1200);
+   loader_dri3_pacer_note_submitted(&pacer, 1, 1200, true);
    loader_dri3_pacer_reset_generation(&pacer, 1300);
    loader_dri3_pacer_note_producer_ready(&pacer, 1, 1350);
    assert(pacer.production_count == 0);
    assert(pacer.residence_count == 0);
    loader_dri3_pacer_note_complete(&pacer, 1, 10000, 2, 1400);
+   loader_dri3_pacer_note_backend_released(&pacer, 1, true, 1450);
    assert(pacer.last_complete_ust == 0);
    assert(pacer.generation_needs_current_completion);
    assert(pacer.completion_count == 0);
@@ -228,7 +253,8 @@ test_old_generation_feedback_does_not_seed_timeline(void)
    loader_dri3_pacer_note_storage_released(&pacer, 1, 1500);
    assert(pacer.retention_count == 0);
    assert(loader_dri3_pacer_reserve(&pacer, 2, 3, 1500, 1500));
-   loader_dri3_pacer_note_submitted(&pacer, 2, 1600);
+   loader_dri3_pacer_note_submitted(&pacer, 2, 1600, true);
+   loader_dri3_pacer_note_backend_released(&pacer, 2, true, 1650);
    loader_dri3_pacer_note_complete(&pacer, 2, 20000, 3, 1700);
    assert(pacer.last_complete_ust == 20000);
    assert(!pacer.generation_needs_current_completion);
@@ -245,7 +271,10 @@ test_retained_allocations_are_not_recycled(void)
         serial++) {
       assert(loader_dri3_pacer_reserve(&pacer, serial, serial,
                                        serial * 1000, serial * 1000));
-      loader_dri3_pacer_note_submitted(&pacer, serial, serial * 1000 + 1);
+      loader_dri3_pacer_note_submitted(&pacer, serial,
+                                       serial * 1000 + 1, true);
+      loader_dri3_pacer_note_backend_released(
+         &pacer, (uint32_t) serial, true, serial * 1000 + 1);
       loader_dri3_pacer_note_complete(&pacer, serial, serial * 16667,
                                       serial, serial * 1000 + 2);
    }
@@ -266,7 +295,7 @@ test_observation_window(void)
 
    loader_dri3_pacer_init(&pacer, 1);
    assert(loader_dri3_pacer_reserve(&pacer, 1, 2, 1, 2));
-   loader_dri3_pacer_note_submitted(&pacer, 1, 3);
+   loader_dri3_pacer_note_submitted(&pacer, 1, 3, false);
    loader_dri3_pacer_note_block(&pacer,
                                 LOADER_DRI3_PACER_BLOCK_COMMITMENT,
                                 100, 4);
@@ -313,6 +342,7 @@ main(void)
 {
    test_independent_lifetimes();
    test_production_and_submission_credits_are_independent();
+   test_legacy_completion_releases_submission_slot();
    test_ready_residence_covers_both_event_orders();
    test_production_history_and_deadline();
    test_timeout_and_recovery();

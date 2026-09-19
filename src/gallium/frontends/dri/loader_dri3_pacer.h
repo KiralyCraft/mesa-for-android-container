@@ -38,6 +38,8 @@ struct loader_dri3_pacer_frame {
    bool reserved;
    bool producer_ready;
    bool submitted;
+   bool backend_release_expected;
+   bool backend_released;
    bool residence_sampled;
    bool completed;
    bool storage_released;
@@ -65,6 +67,8 @@ struct loader_dri3_pacer_stats {
    uint64_t admitted;
    uint64_t producer_ready;
    uint64_t submitted;
+   uint64_t backend_released;
+   uint64_t backend_retired;
    uint64_t completed;
    uint64_t storage_released;
    uint64_t cancelled;
@@ -90,6 +94,7 @@ struct loader_dri3_pacer_snapshot {
    uint64_t storage_retention_p95_us;
    uint64_t submission_actual_p95_us;
    uint32_t outstanding_frames;
+   uint32_t submission_slots_used;
    uint32_t retained_allocations;
    uint32_t window_max_outstanding;
    uint32_t window_max_retained;
@@ -130,6 +135,7 @@ struct loader_dri3_pacer {
    uint32_t observation_head;
    uint32_t observation_count;
    uint32_t outstanding_frames;
+   uint32_t submission_slots_used;
    uint32_t retained_allocations;
    bool timing_valid;
    bool timing_timed_out;
@@ -164,7 +170,13 @@ loader_dri3_pacer_note_producer_ready(struct loader_dri3_pacer *pacer,
 
 void
 loader_dri3_pacer_note_submitted(struct loader_dri3_pacer *pacer,
-                                 uint64_t serial, uint64_t now_us);
+                                 uint64_t serial, uint64_t now_us,
+                                 bool backend_release_expected);
+
+void
+loader_dri3_pacer_note_backend_released(struct loader_dri3_pacer *pacer,
+                                        uint32_t serial, bool consumed,
+                                        uint64_t now_us);
 
 bool
 loader_dri3_pacer_note_complete(struct loader_dri3_pacer *pacer,
