@@ -1869,9 +1869,11 @@ loader_dri3_swap_buffers_msc(struct loader_dri3_drawable *draw,
    }
 
    /* A paced drawable permits one frame to be produced while its predecessor
-    * is committed to the presentation backend.  Do not turn the allocation
-    * pool into an implicit Present queue: wait for that submission slot before
-    * committing the frame which was just flushed.
+    * is committed to the presentation backend.  The two submission slots
+    * represent the frame at the renderer's current consumption boundary and
+    * at most one commitment for the following opportunity.  Do not turn the
+    * allocation pool into a deeper implicit Present queue: wait for a slot
+    * before committing the frame which was just flushed.
     *
     * The producer work and its native fence worker have already been
     * submitted.  The wait below therefore cannot prevent the dependency from

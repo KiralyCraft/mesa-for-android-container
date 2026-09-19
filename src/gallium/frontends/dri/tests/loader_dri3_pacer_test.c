@@ -20,7 +20,8 @@ finish_frame(struct loader_dri3_pacer *pacer, uint64_t serial,
                                          admitted_us + production_us);
    loader_dri3_pacer_note_submitted(pacer, serial,
                                     admitted_us + production_us + 100, true);
-   assert(!loader_dri3_pacer_submission_credit(pacer));
+   assert(pacer->submission_slots_used == 1);
+   assert(loader_dri3_pacer_submission_credit(pacer));
    loader_dri3_pacer_note_backend_released(
       pacer, (uint32_t) serial, true,
       admitted_us + production_us + 500);
@@ -63,12 +64,14 @@ test_production_and_submission_credits_are_independent(void)
    loader_dri3_pacer_init(&pacer, 1000);
    assert(loader_dri3_pacer_reserve(&pacer, 1, 11, 1000, 1000));
    loader_dri3_pacer_note_submitted(&pacer, 1, 1100, true);
-   assert(!loader_dri3_pacer_submission_credit(&pacer));
+   assert(loader_dri3_pacer_submission_credit(&pacer));
 
    assert(loader_dri3_pacer_production_credit(&pacer));
    assert(loader_dri3_pacer_reserve(&pacer, 2, 0, 1100, 1100));
    loader_dri3_pacer_set_target(&pacer, 2, 12);
    assert(pacer.frames[1].target_msc == 12);
+   loader_dri3_pacer_note_submitted(&pacer, 2, 1200, true);
+   assert(!loader_dri3_pacer_submission_credit(&pacer));
    assert(!loader_dri3_pacer_production_credit(&pacer));
    assert(!loader_dri3_pacer_reserve(&pacer, 3, 13, 1200, 1200));
 
@@ -76,7 +79,7 @@ test_production_and_submission_credits_are_independent(void)
    assert(!loader_dri3_pacer_submission_credit(&pacer));
    loader_dri3_pacer_note_backend_released(&pacer, 1, true, 1350);
    assert(loader_dri3_pacer_submission_credit(&pacer));
-   loader_dri3_pacer_note_submitted(&pacer, 2, 1400, true);
+   assert(pacer.submission_slots_used == 1);
 }
 
 static void
@@ -87,9 +90,13 @@ test_legacy_completion_releases_submission_slot(void)
    loader_dri3_pacer_init(&pacer, 1000);
    assert(loader_dri3_pacer_reserve(&pacer, 1, 11, 1000, 1000));
    loader_dri3_pacer_note_submitted(&pacer, 1, 1100, false);
+   assert(loader_dri3_pacer_submission_credit(&pacer));
+   assert(loader_dri3_pacer_reserve(&pacer, 2, 12, 1100, 1100));
+   loader_dri3_pacer_note_submitted(&pacer, 2, 1150, false);
    assert(!loader_dri3_pacer_submission_credit(&pacer));
    loader_dri3_pacer_note_complete(&pacer, 1, 10000, 11, 1200);
    assert(loader_dri3_pacer_submission_credit(&pacer));
+   assert(pacer.submission_slots_used == 1);
    assert(pacer.stats.backend_released == 1);
 }
 
@@ -190,18 +197,19 @@ test_lost_timing_preserves_dependencies(void)
    assert(snapshot.timing_timed_out);
    assert(snapshot.outstanding_frames == 1);
    assert(snapshot.retained_allocations == 1);
-   assert(!loader_dri3_pacer_submission_credit(&pacer));
+   assert(snapshot.submission_slots_used == 1);
 
    /* A timing timeout cancels only scheduling waits.  Backend capacity,
     * logical completion, and consumer release remain independent. */
    loader_dri3_pacer_note_complete(&pacer, 1, 166670, 10, 105000);
-   assert(!loader_dri3_pacer_submission_credit(&pacer));
    loader_dri3_pacer_snapshot(&pacer, 105000, &snapshot);
    assert(snapshot.outstanding_frames == 0);
    assert(snapshot.retained_allocations == 1);
+   assert(snapshot.submission_slots_used == 1);
 
    loader_dri3_pacer_note_backend_released(&pacer, 1, true, 105500);
    assert(loader_dri3_pacer_submission_credit(&pacer));
+   assert(pacer.submission_slots_used == 0);
 
    loader_dri3_pacer_note_storage_released(&pacer, 1, 106000);
    loader_dri3_pacer_snapshot(&pacer, 106000, &snapshot);
