@@ -134,6 +134,27 @@ test_ready_residence_covers_both_event_orders(void)
 }
 
 static void
+test_future_submissions_get_distinct_targets(void)
+{
+   struct loader_dri3_pacer pacer;
+
+   loader_dri3_pacer_init(&pacer, 1000);
+   assert(loader_dri3_pacer_reserve(&pacer, 1, 0, 1000, 1000));
+   loader_dri3_pacer_set_target(
+      &pacer, 1, loader_dri3_pacer_next_target_msc(&pacer, 10));
+   assert(pacer.frames[0].target_msc == 11);
+   loader_dri3_pacer_note_submitted(&pacer, 1, 1100, true);
+
+   assert(loader_dri3_pacer_reserve(&pacer, 2, 0, 1100, 1100));
+   loader_dri3_pacer_set_target(
+      &pacer, 2, loader_dri3_pacer_next_target_msc(&pacer, 10));
+   assert(pacer.frames[1].target_msc == 12);
+
+   loader_dri3_pacer_note_complete(&pacer, 1, 10000, 11, 1200);
+   assert(loader_dri3_pacer_next_target_msc(&pacer, 11) == 12);
+}
+
+static void
 test_production_history_and_deadline(void)
 {
    struct loader_dri3_pacer pacer;
@@ -353,6 +374,7 @@ main(void)
    test_production_and_submission_credits_are_independent();
    test_legacy_completion_releases_submission_slot();
    test_ready_residence_covers_both_event_orders();
+   test_future_submissions_get_distinct_targets();
    test_production_history_and_deadline();
    test_timeout_and_recovery();
    test_lost_timing_preserves_dependencies();

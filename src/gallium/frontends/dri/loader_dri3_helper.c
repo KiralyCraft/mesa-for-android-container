@@ -1952,9 +1952,10 @@ loader_dri3_swap_buffers_msc(struct loader_dri3_drawable *draw,
           * But server side window msc is way bigger than N, so it will
           * think all these present requests are outdated and just show the
           * Nth request at the next vblank. [1 .. N-1] requests are skipped.
-          */
+         */
          if (paced_present) {
-            target_msc = draw->msc + 1;
+            target_msc = loader_dri3_pacer_next_target_msc(&draw->pacer,
+                                                            draw->msc);
          } else if (draw->swap_interval != 0) {
             while (draw->recv_sbc != draw->send_sbc) {
                if (!dri3_wait_for_event_locked(draw, NULL))

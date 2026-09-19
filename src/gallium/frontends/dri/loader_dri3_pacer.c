@@ -227,6 +227,32 @@ loader_dri3_pacer_set_target(struct loader_dri3_pacer *pacer,
       frame->target_msc = target_msc;
 }
 
+uint64_t
+loader_dri3_pacer_next_target_msc(const struct loader_dri3_pacer *pacer,
+                                  uint64_t current_msc)
+{
+   uint64_t target_msc = current_msc == UINT64_MAX ?
+                         UINT64_MAX : current_msc + 1;
+
+   /* With one future commitment, draw->msc may not yet include the preceding
+    * submitted frame.  Give every incomplete current-generation submission a
+    * distinct opportunity instead of allowing Present to supersede two
+    * requests carrying the same target MSC. */
+   for (unsigned i = 0; i < LOADER_DRI3_PACER_FRAME_SLOTS; i++) {
+      const struct loader_dri3_pacer_frame *frame = &pacer->frames[i];
+
+      if (!frame->reserved || !frame->submitted || frame->completed ||
+          frame->cancelled || frame->generation != pacer->generation ||
+          frame->target_msc < target_msc)
+         continue;
+
+      target_msc = frame->target_msc == UINT64_MAX ?
+                   UINT64_MAX : frame->target_msc + 1;
+   }
+
+   return target_msc;
+}
+
 void
 loader_dri3_pacer_note_producer_ready(struct loader_dri3_pacer *pacer,
                                       uint64_t serial, uint64_t now_us)

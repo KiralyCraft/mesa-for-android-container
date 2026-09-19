@@ -166,6 +166,10 @@ void
 loader_dri3_pacer_set_target(struct loader_dri3_pacer *pacer,
                              uint64_t serial, uint64_t target_msc);
 
+uint64_t
+loader_dri3_pacer_next_target_msc(const struct loader_dri3_pacer *pacer,
+                                  uint64_t current_msc);
+
 void
 loader_dri3_pacer_note_producer_ready(struct loader_dri3_pacer *pacer,
                                       uint64_t serial, uint64_t now_us);
