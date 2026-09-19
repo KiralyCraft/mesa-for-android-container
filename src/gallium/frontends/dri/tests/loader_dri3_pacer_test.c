@@ -249,6 +249,27 @@ test_choreographer_deadline_drives_admission(void)
 }
 
 static void
+test_pipeline_latency_does_not_reduce_cadence(void)
+{
+   struct loader_dri3_pacer pacer;
+
+   loader_dri3_pacer_init(&pacer, 1000000);
+   pacer.production_count = LOADER_DRI3_PACER_MIN_SAMPLES;
+   for (unsigned i = 0; i < pacer.production_count; i++)
+      pacer.production_us[i] = 22000;
+
+   /* MSC 10 is the next sequential production target.  Its selection
+    * opportunity is only 13.334 ms away, less than the measured 22 ms
+    * production latency plus the 1 ms guard.  This does not prove that the
+    * workload lacks one-frame-per-refresh throughput: CPU and GPU work may
+    * overlap across the bounded two-frame pipeline.  Admit immediately
+    * instead of delaying production to MSC 11 and imposing a lower cadence. */
+   loader_dri3_pacer_note_timeline(&pacer, 1119000, 1120000,
+                                   1100000, 8, 1117000);
+   assert(loader_dri3_pacer_next_admission(&pacer, 9, 1120000) == 0);
+}
+
+static void
 test_lost_timing_preserves_dependencies(void)
 {
    struct loader_dri3_pacer pacer;
@@ -422,6 +443,7 @@ main(void)
    test_future_submissions_get_distinct_targets();
    test_production_history_and_deadline();
    test_choreographer_deadline_drives_admission();
+   test_pipeline_latency_does_not_reduce_cadence();
    test_timeout_and_recovery();
    test_lost_timing_preserves_dependencies();
    test_generation_reset_and_cancel();

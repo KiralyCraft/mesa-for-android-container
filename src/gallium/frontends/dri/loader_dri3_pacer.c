@@ -657,15 +657,19 @@ loader_dri3_pacer_next_admission(const struct loader_dri3_pacer *pacer,
          opportunity_us = pacer->last_timeline_opportunity_us +
                           msc_delta * pacer->period_us;
 
-         /* Missing an opportunity advances phase; it never creates a
-          * catch-up burst.  Bound projection to the same short horizon used
-          * by the two-frame ledger. */
-         for (unsigned i = 0;
-              opportunity_us <= now_us + lead_us && i < 2; i++)
-            opportunity_us += pacer->period_us;
+         /* End-to-end production latency is not a throughput measurement.
+          * A pipelined application can sustain one frame per refresh even
+          * when CPU plus GPU latency spans more than one refresh interval.
+          * If there is no longer a full measured lead before the next
+          * sequential opportunity, admit immediately and let the bounded
+          * producer/commitment credits preserve overlap.  Advancing to a
+          * later opportunity here would turn latency into an artificial
+          * refresh divisor and serialize workloads which FIFO can pipeline. */
+         if (opportunity_us <= now_us ||
+             opportunity_us - now_us <= lead_us)
+            return 0;
 
-         if (opportunity_us > lead_us && opportunity_us > now_us &&
-             opportunity_us - now_us <= pacer->period_us * 3)
+         if (opportunity_us - now_us <= pacer->period_us * 3)
             return opportunity_us - lead_us;
       }
    }
