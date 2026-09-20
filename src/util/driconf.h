@@ -410,6 +410,10 @@
    DRI_CONF_OPT_B(block_on_depleted_buffers, def, \
                   "Block clients using buffer backpressure until new buffer is available to reduce latency")
 
+#define DRI_CONF_DRI3_PRESENT_MODE(def) \
+   DRI_CONF_OPT_S(dri3_present_mode, def, \
+                  "DRI3 presentation policy: unpaced, auto, or paced")
+
 #define DRI_CONF_MESA_GLTHREAD_DRIVER(def) \
    DRI_CONF_OPT_B(mesa_glthread_driver, def, \
                   "Enable offloading GL driver work to a separate thread")

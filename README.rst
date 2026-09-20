@@ -1,6 +1,44 @@
 `Mesa <https://mesa3d.org>`_ - The 3D Graphics Library
 ======================================================
 
+KGSL paced-Present compatibility
+--------------------------------
+
+The ``kgsl-present-wait-fence-paced-minimal`` branch is the Mesa side of a
+standalone, bounded Present-pacing pair for Termux:X11.  Its runtime behaviour
+is derived from Mesa commit
+``dcb971f9cdaa69587f1e3c92e85915e421827239``, with unused future telemetry
+scaffolding removed.
+
+Use it with the Termux:X11 branch
+`fix/present-vblank-pacing-minimal
+<https://github.com/KiralyCraft/termux-x11/tree/fix/present-vblank-pacing-minimal>`_,
+whose matching runtime checkpoint is
+`cbf866f573253110accd641f72650bad438c220d
+<https://github.com/KiralyCraft/termux-x11/commit/cbf866f573253110accd641f72650bad438c220d>`_.
+Enable the policy explicitly with ``MESA_DRI3_PRESENT_MODE=paced``; synchronized
+unpaced Present remains the default and fallback.
+
+This pair retains PR96's native-fence-to-X-Sync bridge, bounded production and
+submission, MSC-based pacing, API-33 Choreographer timestamps, API-24 fallback,
+and server-reset recovery.  It intentionally excludes measured GMEM/SYSMEM
+training, consumer-owned allocation, actual-presentation feedback, custom
+deadline/opportunity transport, and SurfaceControl direct presentation.
+
+Local HDMI coexistence integration
+----------------------------------
+
+The local ``test/hdmi-pr96-paced-minimal-coexist-20260920`` branch combines
+the minimal paced-Present history above with the PR101 leased-screen stack
+through ``16487e37e``.  It is a deployment integration branch rather than the
+published Mesa half of the Termux:X11 pair.
+
+The HDMI SHM, shadow, and renderonly paths retain their existing presentation
+queues and synchronization.  The bounded pacer activates only for an ordinary
+DRI3 window whose server advertises all required Termux:X11 pacing
+capabilities, so selecting ``MESA_DRI3_PRESENT_MODE=paced`` remains safe on the
+HDMI Xorg path and falls back to its established synchronized presentation.
+
 
 Source
 ------

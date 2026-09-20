@@ -35,6 +35,7 @@
 
 #include <GL/gl.h>
 #include "mesa_interface.h"
+#include "loader_dri3_pacer.h"
 #include "util/macros.h"
 #include "util/u_queue.h"
 #include <c11/threads.h>
@@ -70,7 +71,9 @@ struct loader_dri3_buffer {
 
    uint32_t     sync_fence;     /* XID of X SyncFence object */
    uint32_t     present_wait_fence; /* GPU completion fence for Present */
-   int          present_wait_fence_triggered;
+   int          present_wait_fence_status;
+   uint64_t     present_wait_ready_serial;
+   uint64_t     present_wait_ready_us;
    struct util_queue_fence present_wait_job;
    struct xshmfence *shm_fence; /* pointer to xshmfence object */
    bool         busy;           /* Set on swap, cleared on IdleNotify */
@@ -114,6 +117,12 @@ struct loader_dri3_shm_bridge_slot {
    size_t size;
    uint32_t stride;
    bool busy;
+};
+
+enum loader_dri3_present_mode {
+   LOADER_DRI3_PRESENT_UNPACED,
+   LOADER_DRI3_PRESENT_AUTO,
+   LOADER_DRI3_PRESENT_PACED,
 };
 
 struct loader_dri3_vtable {
@@ -207,7 +216,12 @@ struct loader_dri3_drawable {
    uint64_t shm_bridge_bytes;
    uint64_t shm_bridge_waits;
    int64_t shm_bridge_stats_started_ns;
+   bool admission_pacing;
+   bool pacing_trace;
    int swap_interval;
+   enum loader_dri3_present_mode present_mode;
+   uint32_t present_capabilities;
+   struct loader_dri3_pacer pacer;
 
    struct loader_dri3_present_sync *present_sync;
 
