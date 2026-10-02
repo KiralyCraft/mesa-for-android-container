@@ -1514,6 +1514,16 @@ fd_resource_create_with_modifiers(struct pipe_screen *pscreen,
       /* note: alignment is wrong for a6xx */
       scanout_templat.width0 = align(tmpl->width0, screen->info->gmem_align_w);
 
+      /* fdl6_layout_image() pads the final linear level to four rows for
+       * GMEM blit over-fetch.  KMS dumb allocation only accounts for the
+       * requested height (plus page rounding), which can leave a KGSL
+       * import smaller than its required layout during window resizing.
+       * Pad the backing allocation, keeping the imported resource's
+       * logical dimensions in tmpl unchanged.
+       */
+      if (screen->is_kgsl && is_a6xx(screen))
+         scanout_templat.height0 = align(tmpl->height0, 4);
+
       scanout =
          renderonly_scanout_for_resource(&scanout_templat, screen->ro, &handle);
       if (!scanout)
