@@ -444,6 +444,7 @@ hdmi_pipe_present(struct loader_dri3_drawable *draw, struct loader_dri3_buffer *
    mtx_unlock(&p->lock);
    mtx_lock(&draw->mtx); buffer->busy=true; mtx_unlock(&draw->mtx);
    int fd=producer_fd;
+   int64_t submit_started=os_time_get(), integrated_submit_us=0;
    if (s->integrated) {
       struct dri_context *ctx=draw->vtable->get_dri_context(draw);
       if (producer_fd >= 0) close(producer_fd);
@@ -455,6 +456,7 @@ hdmi_pipe_present(struct loader_dri3_drawable *draw, struct loader_dri3_buffer *
             dri2_blit_image(ctx,s->image,buffer->image,0,0,g->width,g->height,0,0,g->width,g->height,__BLIT_FLAG_FINISH);
       }
    }
+   if (s->integrated) integrated_submit_us=os_time_get()-submit_started;
    if (fd >= 0) {
       mtx_lock(&draw->mtx);
       s->sbc=++draw->send_sbc; buffer->last_swap=s->sbc;
@@ -463,6 +465,7 @@ hdmi_pipe_present(struct loader_dri3_drawable *draw, struct loader_dri3_buffer *
       mtx_unlock(&draw->mtx);
    }
    mtx_lock(&p->lock);
+   p->submit_us+=integrated_submit_us;
    s->fence_fd=fd; s->phase=HDMI_PRODUCER; s->started_ns=os_time_get();
    if (fd < 0) { p_atomic_set(&p->failed,true); hdmi_pipe_release_source(p,s); s->phase=HDMI_FREE; }
    else if (s->integrated) p->resolved++;
