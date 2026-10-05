@@ -18,7 +18,7 @@ struct hdmi_pipe_slot {
    enum hdmi_pipe_phase phase;
    int fence_fd, interval;
    uint32_t serial;
-   uint64_t order;
+   uint64_t order, sbc;
    bool completed, idle, integrated;
    int64_t started_ns;
 };
@@ -204,6 +204,7 @@ hdmi_pipe_events(struct hdmi_pipe *p)
    xcb_generic_event_t *event;
    while ((event = xcb_poll_for_special_event(p->conn, p->events))) {
       xcb_present_generic_event_t *ge = (void *)event;
+      uint64_t completed_sbc=0, completed_msc=0, completed_ust=0;
       mtx_lock(&p->lock);
       for (unsigned g = 0; g < HDMI_PIPE_GENERATIONS; g++) {
          for (unsigned i = 0; i < HDMI_PIPE_SLOTS; i++) {
@@ -212,7 +213,10 @@ hdmi_pipe_events(struct hdmi_pipe *p)
             if (ge->evtype == XCB_PRESENT_EVENT_COMPLETE_NOTIFY) {
                xcb_present_complete_notify_event_t *ce = (void *)ge;
                if (ce->kind == XCB_PRESENT_COMPLETE_KIND_PIXMAP && ce->serial == s->serial) {
-                  s->completed = true; p->completed++; p->msc = ce->msc;
+                  if (!s->completed) {
+                     s->completed = true; p->completed++; p->msc = ce->msc;
+                     completed_sbc=s->sbc; completed_msc=ce->msc; completed_ust=ce->ust;
+                  }
                   if (!p->primed || p->target_msc <= ce->msc) p->target_msc = ce->msc + 2;
                   p->primed = true;
                }
@@ -225,6 +229,15 @@ hdmi_pipe_events(struct hdmi_pipe *p)
       }
       cnd_broadcast(&p->changed);
       mtx_unlock(&p->lock);
+      if (completed_sbc) {
+         mtx_lock(&p->draw->mtx);
+         if (completed_sbc > p->draw->recv_sbc) {
+            p->draw->recv_sbc=completed_sbc;
+            p->draw->msc=completed_msc; p->draw->ust=completed_ust;
+         }
+         cnd_broadcast(&p->draw->event_cnd);
+         mtx_unlock(&p->draw->mtx);
+      }
       free(event);
    }
    while ((event = xcb_poll_for_event(p->conn))) {
@@ -441,6 +454,13 @@ hdmi_pipe_present(struct loader_dri3_drawable *draw, struct loader_dri3_buffer *
          if (fd < 0)
             dri2_blit_image(ctx,s->image,buffer->image,0,0,g->width,g->height,0,0,g->width,g->height,__BLIT_FLAG_FINISH);
       }
+   }
+   if (fd >= 0) {
+      mtx_lock(&draw->mtx);
+      s->sbc=++draw->send_sbc; buffer->last_swap=s->sbc;
+      if (draw->stamp) ++(*draw->stamp);
+      draw->cur_back=(draw->cur_back+1)%draw->max_num_back;
+      mtx_unlock(&draw->mtx);
    }
    mtx_lock(&p->lock);
    s->fence_fd=fd; s->phase=HDMI_PRODUCER; s->started_ns=os_time_get();

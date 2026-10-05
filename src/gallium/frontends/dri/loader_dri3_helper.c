@@ -2075,6 +2075,14 @@ loader_dri3_wait_for_sbc(struct loader_dri3_drawable *draw,
       target_sbc = draw->send_sbc;
 
    while (draw->recv_sbc < target_sbc) {
+      if (draw->hdmi_pipeline_enabled) {
+         struct hdmi_pipe *p=draw->hdmi_pipeline;
+         if (!p || p_atomic_read(&p->failed) || p_atomic_read(&p->stop)) {
+            mtx_unlock(&draw->mtx); return 0;
+         }
+         cnd_wait(&draw->event_cnd,&draw->mtx);
+         continue;
+      }
       if (!dri3_wait_for_event_locked(draw, NULL)) {
          mtx_unlock(&draw->mtx);
          return 0;
@@ -2576,6 +2584,10 @@ loader_dri3_swap_buffers_msc(struct loader_dri3_drawable *draw,
 
    }
    if (bridge_presented) {
+      if (draw->hdmi_pipeline_enabled) {
+         dri_invalidate_drawable(draw->dri_drawable);
+         return (int64_t)draw->send_sbc;
+      }
       mtx_lock(&draw->mtx);
       draw->send_sbc++;
       draw->recv_sbc = draw->send_sbc;
