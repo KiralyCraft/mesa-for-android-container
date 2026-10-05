@@ -3,7 +3,6 @@
  * drawable ABI must come from the same Mesa build. No native fence is passed
  * as an X11 shared-memory fence; Present is sent only after successful readiness.
  */
-#include <linux/sync_file.h>
 #include <sys/stat.h>
 
 #define HDMI_PIPE_GENERATIONS 3
