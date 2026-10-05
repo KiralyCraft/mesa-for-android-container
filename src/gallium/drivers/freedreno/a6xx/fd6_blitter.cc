@@ -10,6 +10,8 @@
 #include "util/format_srgb.h"
 #include "util/half_float.h"
 #include "util/u_dump.h"
+#include "util/u_debug.h"
+#include "util/log.h"
 #include "util/u_helpers.h"
 #include "util/u_log.h"
 #include "util/u_transfer.h"
@@ -1550,7 +1552,7 @@ handle_override_blit(struct fd_context *ctx,
 
 template <chip CHIP>
 static bool
-fd6_blit(struct fd_context *ctx, const struct pipe_blit_info *info) assert_dt
+fd6_blit_impl(struct fd_context *ctx, const struct pipe_blit_info *info) assert_dt
 {
    fail_if(info->render_condition_enable && ctx->cond_query);
 
@@ -1581,6 +1583,24 @@ fd6_blit(struct fd_context *ctx, const struct pipe_blit_info *info) assert_dt
    }
 
    return handle_rgba_blit<CHIP>(ctx, info);
+}
+
+/* Count successful 2D command-generation paths, not just GL entry points.
+ * Per-thread counters avoid contended atomics in ordinary rendering. */
+template <chip CHIP>
+static bool
+fd6_blit(struct fd_context *ctx, const struct pipe_blit_info *info) assert_dt
+{
+   const bool hardware=fd6_blit_impl<CHIP>(ctx,info);
+   if (debug_get_bool_option("MESA_KGSL_HDMI_BLIT_STATS",false)) {
+      static thread_local uint64_t attempted, accepted, pixels;
+      attempted++;
+      if (hardware) { accepted++; pixels+=(uint64_t)abs(info->dst.box.width)*abs(info->dst.box.height); }
+      if (attempted == 1 || !(attempted % 1024))
+         mesa_logi("HDMI Freedreno 2D attempted=%" PRIu64 " hardware=%" PRIu64 " fallback=%" PRIu64 " pixels=%" PRIu64,
+                   attempted,accepted,attempted-accepted,pixels);
+   }
+   return hardware;
 }
 
 template <chip CHIP>

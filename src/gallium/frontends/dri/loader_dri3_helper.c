@@ -143,6 +143,8 @@ loader_dri3_blit_context_get(struct loader_dri3_drawable *draw);
 static void
 loader_dri3_blit_context_put(void);
 
+#include "loader_dri3_hdmi_pipeline.h"
+
 static int64_t
 dri3_shm_bridge_now_ns(void)
 {
@@ -1517,6 +1519,39 @@ dri3_set_render_buffer(struct loader_dri3_drawable *draw, int buf_id,
    draw->buffers[buf_id] = buffer;
 }
 
+static void
+dri3_destroy_render_buffer(struct loader_dri3_drawable *draw,
+                           struct loader_dri3_buffer *buffer)
+{
+   if (buffer->present_wait_fence && draw->present_sync) {
+      util_queue_fence_wait(&buffer->present_wait_job);
+      dri3_record_present_wait_ready(draw, buffer);
+   }
+
+   if (buffer->present_wait_fence &&
+       p_atomic_read(&buffer->present_wait_fence_status) ==
+       DRI3_PRESENT_WAIT_FAILED) {
+      /* The server can still hold a Present request waiting on this fence.
+       * Keep the pixmap, X fence, and images quarantined rather than turning
+       * an unfinished producer into a ready buffer during teardown. */
+      mesa_loge("DRI3: quarantining buffer %u after a failed producer fence",
+                buffer->pixmap);
+      return;
+   }
+
+   if (buffer->present_wait_fence) {
+      util_queue_fence_destroy(&buffer->present_wait_job);
+      xcb_sync_destroy_fence(draw->conn, buffer->present_wait_fence);
+   }
+   if (buffer->own_pixmap)
+      xcb_free_pixmap(draw->conn, buffer->pixmap);
+   dri2_destroy_image(buffer->image);
+   if (buffer->linear_buffer)
+      dri2_destroy_image(buffer->linear_buffer);
+   free(buffer);
+
+}
+
 /** dri3_free_render_buffer
  *
  * Free everything associated with one render buffer including pixmap, fence
@@ -1531,35 +1566,10 @@ dri3_free_render_buffer(struct loader_dri3_drawable *draw,
    if (!buffer)
       return;
 
-   if (buffer->present_wait_fence && draw->present_sync) {
-      util_queue_fence_wait(&buffer->present_wait_job);
-      dri3_record_present_wait_ready(draw, buffer);
-   }
-
-   if (buffer->present_wait_fence &&
-       p_atomic_read(&buffer->present_wait_fence_status) ==
-       DRI3_PRESENT_WAIT_FAILED) {
-      /* The server can still hold a Present request waiting on this fence.
-       * Keep the pixmap, X fence, and images quarantined rather than turning
-       * an unfinished producer into a ready buffer during teardown. */
-      mesa_loge("DRI3: quarantining buffer %u after a failed producer fence",
-                buffer->pixmap);
-      draw->buffers[buf_id] = NULL;
-      if (buf_id != LOADER_DRI3_FRONT_ID)
-         draw->cur_num_back--;
-      return;
-   }
-
-   if (buffer->present_wait_fence) {
-      util_queue_fence_destroy(&buffer->present_wait_job);
-      xcb_sync_destroy_fence(draw->conn, buffer->present_wait_fence);
-   }
-   if (buffer->own_pixmap)
-      xcb_free_pixmap(draw->conn, buffer->pixmap);
-   dri2_destroy_image(buffer->image);
-   if (buffer->linear_buffer)
-      dri2_destroy_image(buffer->linear_buffer);
-   free(buffer);
+   if (buffer->pipeline_refs)
+      hdmi_pipe_buffer_unref(draw,buffer);
+   else
+      dri3_destroy_render_buffer(draw,buffer);
 
    draw->buffers[buf_id] = NULL;
 
@@ -1614,6 +1624,8 @@ loader_dri3_drawable_fini(struct loader_dri3_drawable *draw)
    for (i = 0; i < ARRAY_SIZE(draw->buffers); i++)
       dri3_free_render_buffer(draw, i);
 
+   hdmi_pipe_fini(draw);
+
    if (draw->special_event) {
       xcb_void_cookie_t cookie =
          xcb_present_select_input_checked(draw->conn, draw->eid, draw->drawable,
@@ -1660,6 +1672,15 @@ loader_dri3_drawable_init(xcb_connection_t *conn,
    draw->present_sync = NULL;
    draw->shm_bridge =
       debug_get_bool_option("MESA_KGSL_X11_SHM_BRIDGE", false);
+   draw->hdmi_pipeline = NULL;
+   draw->hdmi_pipeline_enabled = type == LOADER_DRI3_DRAWABLE_WINDOW &&
+      debug_get_bool_option("MESA_KGSL_X11_PIPELINE",false);
+   draw->hdmi_pipeline_resolve = draw->hdmi_pipeline_enabled &&
+      debug_get_bool_option("MESA_KGSL_X11_INTEGRATED_RESOLVE",false);
+   if (draw->hdmi_pipeline_enabled && (!draw->shm_bridge || !vtable->flush_drawable_with_fence_fd)) {
+      mesa_loge("DRI3: HDMI pipeline requires the accelerated bridge and native producer fences");
+      return 1;
+   }
    draw->shadow_present =
       debug_get_bool_option("MESA_KGSL_X11_SHADOW", false);
    if (draw->shm_bridge && draw->shadow_present) {
@@ -2072,6 +2093,15 @@ loader_dri3_wait_for_sbc(struct loader_dri3_drawable *draw,
  * Find an idle back buffer. If there isn't one, then
  * wait for a present idle notify event from the X server
  */
+static bool
+dri3_pipeline_wait_back(struct loader_dri3_drawable *draw)
+{
+   struct hdmi_pipe *p=draw->hdmi_pipeline;
+   if (!p || p_atomic_read(&p->failed) || p_atomic_read(&p->stop)) return false;
+   cnd_wait(&draw->event_cnd,&draw->mtx);
+   return !p_atomic_read(&p->failed) && !p_atomic_read(&p->stop);
+}
+
 static int
 dri3_find_back(struct loader_dri3_drawable *draw, bool prefer_a_different)
 {
@@ -2138,7 +2168,7 @@ dri3_find_back(struct loader_dri3_drawable *draw, bool prefer_a_different)
       if (prefer_a_different && best_id == -1 &&
           !draw->buffers[LOADER_DRI3_BACK_ID(current_back_id)]->busy)
          best_id = current_back_id;
-   } while (best_id == -1 && dri3_wait_for_event_locked(draw, NULL));
+   } while (best_id == -1 && (draw->hdmi_pipeline_enabled ? dri3_pipeline_wait_back(draw) : dri3_wait_for_event_locked(draw, NULL)));
 
    if (best_id != -1)
       draw->cur_back = best_id;
@@ -2470,7 +2500,7 @@ loader_dri3_swap_buffers_msc(struct loader_dri3_drawable *draw,
       frame_admitted_generation = draw->pacer.generation;
    }
 
-   if (!shadow_present) {
+   if (!shadow_present && !draw->hdmi_pipeline_resolve) {
       if (draw->type == LOADER_DRI3_DRAWABLE_WINDOW &&
           (draw->shm_bridge || (draw->present_sync && !prime_explicit_sync)) &&
           draw->vtable->flush_drawable_with_fence_fd) {
@@ -2527,7 +2557,15 @@ loader_dri3_swap_buffers_msc(struct loader_dri3_drawable *draw,
    }
 
    bool bridge_presented = false;
-   if (draw->shm_bridge && draw->type == LOADER_DRI3_DRAWABLE_WINDOW) {
+   if (draw->hdmi_pipeline_enabled) {
+      bridge_presented=hdmi_pipe_present(draw,back,render_fence_fd,flush_flags);
+      render_fence_fd=-1;
+      if (!bridge_presented) {
+         mesa_loge("DRI3: HDMI pipeline failed; accelerated Present rejected");
+         return ret;
+      }
+   }
+   if (!draw->hdmi_pipeline_enabled && draw->shm_bridge && draw->type == LOADER_DRI3_DRAWABLE_WINDOW) {
       bridge_presented =
          dri3_shm_bridge_present(draw, back, rects, n_rects,
                                  render_fence_fd);
@@ -3078,6 +3116,18 @@ dri3_alloc_render_buffer(struct loader_dri3_drawable *draw, unsigned int fourcc,
    bool shadow_present =
       draw->shadow_present && draw->type == LOADER_DRI3_DRAWABLE_WINDOW &&
       buffer_type == loader_dri3_buffer_back;
+
+   if (draw->hdmi_pipeline_enabled && buffer_type == loader_dri3_buffer_back) {
+      if (!hdmi_pipe_init(draw)) goto no_image;
+      buffer->pipeline_refs=1;
+      if (draw->hdmi_pipeline_resolve) {
+         buffer->image=dri_create_image(draw->dri_screen_render_gpu,width,height,format,NULL,0,
+            __DRI_IMAGE_USE_BACKBUFFER | (draw->is_protected_content ? __DRI_IMAGE_USE_PROTECTED : 0),buffer);
+         if (!buffer->image) goto no_image;
+         buffer->width=width; buffer->height=height;
+         return buffer;
+      }
+   }
 
    if (shadow_present) {
       /* Keep the application's render target private so Freedreno can select
@@ -3727,6 +3777,11 @@ dri3_get_buffer(struct dri_drawable *driDrawable,
                                      MIN2(buffer->height, new_buffer->height),
                                      0, 0, 0) &&
              !buffer->linear_buffer) {
+            if (draw->hdmi_pipeline_resolve) {
+               dri3_destroy_render_buffer(draw,new_buffer);
+               mesa_loge("DRI3: cannot preserve resized private image with GPU copy");
+               return NULL;
+            }
             dri3_fence_reset(draw->conn, new_buffer);
             dri3_copy_area(draw->conn,
                            buffer->pixmap,
