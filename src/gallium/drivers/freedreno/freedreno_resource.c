@@ -1598,6 +1598,12 @@ fd_resource_from_handle(struct pipe_screen *pscreen,
    }
 
    rsc->b.is_shared = true;
+   /* An imported DMA-BUF already has an external owner. Never move its
+    * storage into a newly allocated shadow merely because get_handle() is
+    * later used to query/export metadata. That would detach the EGL/DRI image
+    * from the buffer the other process still consumes. */
+   if (screen->kgsl_dmabuf)
+      prsc->bind |= PIPE_BIND_SHARED;
 
    struct fd_bo *bo = fd_screen_bo_from_handle(pscreen, handle);
    if (!bo) {

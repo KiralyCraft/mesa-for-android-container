@@ -330,7 +330,7 @@ hdmi_pipe_thread(void *data)
                int64_t acquired = os_time_get();
                int fd = -1;
                if (ctx) {
-                  dri2_blit_image(ctx,destination,source->image,0,0,gen->width,gen->height,0,0,gen->width,gen->height,0);
+                  dri2_blit_image(ctx,destination,source->image,0,0,gen->width,gen->height,0,0,gen->width,gen->height,__BLIT_FLAG_FLUSH);
                   fd = hdmi_pipe_native_fence(ctx);
                   if (fd < 0) {
                      /* Error recovery only: retain ordering and drain the
@@ -449,7 +449,7 @@ hdmi_pipe_present(struct loader_dri3_drawable *draw, struct loader_dri3_buffer *
       if (producer_fd >= 0) close(producer_fd);
       fd=-1;
       if (ctx && draw->vtable->in_current_context(draw) && draw->vtable->flush_drawable_with_fence_fd) {
-         dri2_blit_image(ctx,s->image,buffer->image,0,0,g->width,g->height,0,0,g->width,g->height,0);
+         dri2_blit_image(ctx,s->image,buffer->image,0,0,g->width,g->height,0,0,g->width,g->height,__BLIT_FLAG_FLUSH);
          fd=draw->vtable->flush_drawable_with_fence_fd(draw,flush_flags);
          if (fd < 0)
             dri2_blit_image(ctx,s->image,buffer->image,0,0,g->width,g->height,0,0,g->width,g->height,__BLIT_FLAG_FINISH);
