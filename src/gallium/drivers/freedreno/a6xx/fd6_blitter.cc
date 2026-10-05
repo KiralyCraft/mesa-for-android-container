@@ -28,6 +28,8 @@
 #include "fd6_pack.h"
 #include "fd6_resource.h"
 
+static thread_local uint64_t hdmi_cp_blits;
+
 static inline enum a6xx_2d_ifmt
 fd6_ifmt(enum a6xx_format fmt)
 {
@@ -1347,6 +1349,8 @@ handle_rgba_blit(struct fd_context *ctx, const struct pipe_blit_info *info)
       emit_blit_texture<CHIP>(ctx, cs, info);
    }
 
+   hdmi_cp_blits++; /* Commands emitted by the actual hardware-copy path. */
+
    trace_end_blit(&batch->trace, cs);
 
    fd6_emit_flushes<CHIP>(batch->ctx, cs,
@@ -1591,16 +1595,19 @@ template <chip CHIP>
 static bool
 fd6_blit(struct fd_context *ctx, const struct pipe_blit_info *info) assert_dt
 {
-   const bool hardware=fd6_blit_impl<CHIP>(ctx,info);
+   const uint64_t before=hdmi_cp_blits;
+   const bool handled=fd6_blit_impl<CHIP>(ctx,info);
+   const bool hardware=hdmi_cp_blits != before;
    if (debug_get_bool_option("MESA_KGSL_HDMI_BLIT_STATS",false)) {
       static thread_local uint64_t attempted, accepted, pixels;
       attempted++;
       if (hardware) { accepted++; pixels+=(uint64_t)abs(info->dst.box.width)*abs(info->dst.box.height); }
-      if (attempted == 1 || !(attempted % 1024))
-         mesa_logi("HDMI Freedreno 2D attempted=%" PRIu64 " hardware=%" PRIu64 " fallback=%" PRIu64 " pixels=%" PRIu64,
-                   attempted,accepted,attempted-accepted,pixels);
+      const unsigned interval=MAX2(debug_get_num_option("MESA_KGSL_HDMI_BLIT_STATS_INTERVAL",1024),1);
+      if (attempted == 1 || !(attempted % interval))
+         mesa_logi("HDMI Freedreno 2D attempted=%" PRIu64 " hardware=%" PRIu64 " fallback=%" PRIu64 " pixels=%" PRIu64 " src=%s dst=%s cp_blit=%d",
+                   attempted,accepted,attempted-accepted,pixels,util_format_short_name(info->src.format),util_format_short_name(info->dst.format),hardware);
    }
-   return hardware;
+   return handled;
 }
 
 template <chip CHIP>
