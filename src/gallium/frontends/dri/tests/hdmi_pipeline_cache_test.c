@@ -23,6 +23,7 @@
 #define __DRI_IMAGE_ATTRIB_FOURCC 2
 #define __DRI_IMAGE_ATTRIB_FD 3
 #define FORMAT 0x34325258
+#define XCB_IMAGE_FORMAT_Z_PIXMAP 2
 struct hdmi_pipe;
 typedef struct { unsigned width_in_pixels,height_in_pixels; } xcb_screen_t;
 struct dri_image { unsigned width,height; uint64_t bytes; };
@@ -34,6 +35,7 @@ typedef unsigned xcb_pixmap_t;
 typedef unsigned xcb_xfixes_region_t;
 typedef unsigned xcb_present_event_t;
 typedef struct { int error_code; } xcb_generic_error_t;
+typedef struct { int unused; } xcb_get_image_reply_t;
 static xcb_connection_t allocation={1}, events={2};
 static mtx_t *event_lock;
 static _Thread_local int owns_event;
@@ -49,6 +51,12 @@ static int fail_create, fail_import, fail_region, create_pending_error;
 static uint64_t padded_bytes;
 static struct { unsigned w,h;bool live; } pixmaps[4096];
 static bool regions[4096];
+static bool readback_control;
+static unsigned readbacks;
+static bool debug_get_bool_option(const char *name,bool fallback) {
+ assert(!strcmp(name,"MESA_KGSL_HDMI_ALLOC_READBACK_CONTROL"));
+ return readback_control||fallback;
+}
 static void check_external(xcb_connection_t *c) { assert(c==&allocation);assert(!owns_event); }
 static unsigned xcb_generate_id(xcb_connection_t *c) {check_external(c);assert(++next_id<4096);return next_id;}
 static int xcb_create_pixmap_checked(xcb_connection_t *c,unsigned depth,unsigned id,unsigned win,unsigned w,unsigned h) {
@@ -69,6 +77,15 @@ static void xcb_xfixes_destroy_region(xcb_connection_t *c,unsigned id) {
  check_external(c);assert(regions[id]);regions[id]=false;live_regions--;
 }
 static void xcb_flush(xcb_connection_t *c) {check_external(c);}
+static unsigned xcb_get_image(xcb_connection_t *c,unsigned format,unsigned pixmap,
+                             int x,int y,unsigned w,unsigned h,unsigned mask) {
+ check_external(c);assert(format==XCB_IMAGE_FORMAT_Z_PIXMAP&&pixmaps[pixmap].live);
+ assert(!x&&!y&&w==1&&h==1&&mask==UINT32_MAX);return pixmap;
+}
+static xcb_get_image_reply_t *xcb_get_image_reply(xcb_connection_t *c,unsigned cookie,void *error) {
+ check_external(c);assert(pixmaps[cookie].live&&!error);readbacks++;
+ return calloc(1,sizeof(xcb_get_image_reply_t));
+}
 static struct dri_image *loader_dri3_get_pixmap_buffer(xcb_connection_t *c,unsigned id,void *screen,unsigned fourcc,bool multi,int *w,int *h,void *unused) {
  (void)screen;(void)multi;(void)unused;check_external(c);assert(fourcc==FORMAT);
  if(fail_import){fail_import=0;return NULL;}assert(pixmaps[id].live);
@@ -153,5 +170,7 @@ int main(void) {
  init(&p,&d);p.resize_capacity=true;fail_region=1;
  assert(!admit(&p,641,479));assert(!live_pixmaps&&!live_images&&!live_regions);
  assert(admit(&p,641,479));fini(&p);
+ assert(!readbacks);readback_control=true;init(&p,&d);
+ assert(admit(&p,641,479));assert(readbacks==HDMI_PIPE_SLOTS);fini(&p);readback_control=false;
  assert(created==destroyed);puts("PASS: production cache reuse, bounded padded allocations, busy pinning, event-lock freedom, retirement, failure cleanup, wait and stop; logical resize capacity, exact fullscreen and region lifetime");
 }

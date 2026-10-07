@@ -186,6 +186,16 @@ hdmi_pipe_allocate_generation(struct hdmi_pipe *p, struct hdmi_pipe_generation *
          p->draw->dri_screen_render_gpu, g->fourcc, p->draw->multiplanes_available,
          &width, &height, NULL);
       if (!s->image || width != g->width || height != g->height) return false;
+      /* Diagnostic control only: this readback drains Xorg's initial
+       * make-exportable copy before this process writes the shared image.
+       * It is never enabled in a normal accelerated runtime. */
+      if (debug_get_bool_option("MESA_KGSL_HDMI_ALLOC_READBACK_CONTROL", false)) {
+         xcb_get_image_reply_t *reply = xcb_get_image_reply(p->allocation_conn,
+            xcb_get_image(p->allocation_conn, XCB_IMAGE_FORMAT_Z_PIXMAP,
+                          s->pixmap, 0, 0, 1, 1, UINT32_MAX), NULL);
+         if (!reply) return false;
+         free(reply);
+      }
       int dma_fd = -1, planes = 0, image_fourcc = 0;
       struct stat allocation;
       bool valid = dri2_query_image(s->image, __DRI_IMAGE_ATTRIB_NUM_PLANES, &planes) && planes == 1 &&
@@ -535,6 +545,19 @@ hdmi_pipe_init(struct loader_dri3_drawable *draw)
    if (!p->conn || xcb_connection_has_error(p->conn)) goto fail;
    p->allocation_conn = xcb_connect(NULL,NULL);
    if (!p->allocation_conn || xcb_connection_has_error(p->allocation_conn)) goto fail;
+   if (p->resize_capacity) {
+      xcb_connection_t *connections[] = {p->conn, p->allocation_conn};
+      for (unsigned i = 0; i < ARRAY_SIZE(connections); i++) {
+         xcb_xfixes_query_version_reply_t *version = xcb_xfixes_query_version_reply(
+            connections[i], xcb_xfixes_query_version(connections[i], 5, 0), NULL);
+         bool supported = version && version->major_version >= 2;
+         free(version);
+         if (!supported) {
+            mesa_loge("DRI3: resize capacity requires XFixes regions on both private connections");
+            goto fail;
+         }
+      }
+   }
    p->eid = xcb_generate_id(p->conn);
    xcb_generic_error_t *error = xcb_request_check(p->conn,
       xcb_present_select_input_checked(p->conn,p->eid,draw->drawable,
