@@ -164,6 +164,15 @@ dri_flush_with_fence_fd(struct dri_context *ctx,
                         unsigned flags,
                         enum __DRI2throttleReason reason);
 
+/* Additional image work belongs after pending vertices, MSAA resolve and HUD
+ * rendering, but before the single end-of-frame flush/fence export. */
+int
+dri_flush_with_fence_fd_and_callback(struct dri_context *ctx,
+                                    struct dri_drawable *drawable,
+                                    unsigned flags,
+                                    enum __DRI2throttleReason reason,
+                                    void (*after_drawable_cb)(void *), void *data);
+
 void
 dri_flush_drawable(struct dri_drawable *dPriv);
 

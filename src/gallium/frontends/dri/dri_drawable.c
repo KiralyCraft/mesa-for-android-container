@@ -404,6 +404,8 @@ struct notify_before_flush_cb_args {
    unsigned flags;
    enum __DRI2throttleReason reason;
    bool swap_msaa_buffers;
+   void (*after_drawable_cb)(void *);
+   void *after_drawable_data;
 };
 
 static void
@@ -451,6 +453,9 @@ notify_before_flush_cb(void* _args)
    }
 
    pipe->flush_resource(pipe, args->drawable->textures[ST_ATTACHMENT_BACK_LEFT]);
+
+   if (args->after_drawable_cb)
+      args->after_drawable_cb(args->after_drawable_data);
 }
 
 /**
@@ -466,7 +471,8 @@ dri_flush_impl(struct dri_context *ctx,
                struct dri_drawable *drawable,
                unsigned flags,
                enum __DRI2throttleReason reason,
-               bool request_fence_fd)
+               bool request_fence_fd,
+               void (*after_drawable_cb)(void *), void *after_drawable_data)
 {
    struct st_context *st;
    struct pipe_screen *screen;
@@ -508,6 +514,13 @@ dri_flush_impl(struct dri_context *ctx,
       args.drawable = drawable;
       args.flags = flags;
       args.reason = reason;
+      args.after_drawable_cb = after_drawable_cb;
+      args.after_drawable_data = after_drawable_data;
+   }
+   else if (after_drawable_cb) {
+      if (drawable)
+         drawable->flushing = false;
+      return -1;
    }
 
    flush_flags = 0;
@@ -608,7 +621,7 @@ dri_flush(struct dri_context *ctx,
           unsigned flags,
           enum __DRI2throttleReason reason)
 {
-   dri_flush_impl(ctx, drawable, flags, reason, false);
+   dri_flush_impl(ctx, drawable, flags, reason, false, NULL, NULL);
 }
 
 int
@@ -617,12 +630,23 @@ dri_flush_with_fence_fd(struct dri_context *ctx,
                         unsigned flags,
                         enum __DRI2throttleReason reason)
 {
-   return dri_flush_impl(ctx, drawable, flags, reason, true);
+   return dri_flush_impl(ctx, drawable, flags, reason, true, NULL, NULL);
 }
 
 /**
  * DRI2 flush extension.
  */
+int
+dri_flush_with_fence_fd_and_callback(struct dri_context *ctx,
+                                    struct dri_drawable *drawable,
+                                    unsigned flags,
+                                    enum __DRI2throttleReason reason,
+                                    void (*after_drawable_cb)(void *), void *data)
+{
+   return dri_flush_impl(ctx, drawable, flags, reason, true,
+                         after_drawable_cb, data);
+}
+
 void
 dri_flush_drawable(struct dri_drawable *dPriv)
 {

@@ -44,7 +44,7 @@ struct hdmi_pipe {
    uint64_t producer_us, submit_us, gpu_us, mutex_us;
    uint64_t cache_clock, cache_hits, cache_evictions;
    /* Mutated under lock; log2-microsecond histograms are emitted at teardown. */
-   struct { uint64_t count, total_us, max_us, buckets[32]; } timing[7];
+   struct { uint64_t count, total_us, max_us, buckets[32]; } timing[8];
    struct hdmi_pipe_generation generations[HDMI_PIPE_GENERATIONS];
    struct hdmi_pipe_generation *retire_generation;
    struct loader_dri3_buffer *retire[HDMI_PIPE_RETIRE];
@@ -53,7 +53,7 @@ struct hdmi_pipe {
 };
 
 enum hdmi_pipe_timing { HDMI_LOCK, HDMI_GENERATION_WAIT, HDMI_ALLOCATE,
-   HDMI_RETIRE, HDMI_SLOT_WAIT, HDMI_RESOLVE_SUBMIT, HDMI_FENCE_EXPORT };
+   HDMI_RETIRE, HDMI_SLOT_WAIT, HDMI_RESOLVE_SUBMIT, HDMI_FENCE_EXPORT, HDMI_DRAWABLE_PREPARE };
 
 /* Caller owns p->lock. Buckets give upper bounds, not exact percentiles. */
 static void
@@ -532,6 +532,28 @@ fail:
    return false;
 }
 
+struct hdmi_pipe_resolve_args {
+   struct dri_context *ctx;
+   struct dri_image *dst, *src;
+   unsigned width, height;
+   int64_t started_us, finished_us;
+};
+
+static void
+hdmi_pipe_resolve_before_flush(void *data)
+{
+   struct hdmi_pipe_resolve_args *args = data;
+   args->started_us = os_time_get();
+   /* dri_flush's callback runs after vertices/bitmap/MSAA/HUD work. Do not
+    * recursively flush here: the enclosing end-of-frame flush exports one
+    * fence covering rendering and the final resolve into shared storage. */
+   dri2_blit_image(args->ctx, args->dst, args->src,
+                   0, 0, args->width, args->height,
+                   0, 0, args->width, args->height, 0);
+   args->ctx->st->pipe->flush_resource(args->ctx->st->pipe, args->dst->texture);
+   args->finished_us = os_time_get();
+}
+
 static bool
 hdmi_pipe_present(struct loader_dri3_drawable *draw, struct loader_dri3_buffer *buffer,
                   int producer_fd, unsigned flush_flags, bool ordinary_swap)
@@ -567,19 +589,26 @@ hdmi_pipe_present(struct loader_dri3_drawable *draw, struct loader_dri3_buffer *
    mtx_unlock(&p->lock);
    mtx_lock(&draw->mtx); buffer->busy=true; mtx_unlock(&draw->mtx);
    int fd=producer_fd;
-   int64_t submit_started=os_time_get(), integrated_submit_us=0, resolve_us=0, export_us=0;
+   int64_t submit_started=os_time_get(), integrated_submit_us=0, resolve_us=0, export_us=0, prepare_us=0;
    if (s->integrated) {
       struct dri_context *ctx=draw->vtable->get_dri_context(draw);
       if (producer_fd >= 0) close(producer_fd);
       fd=-1;
       if (ctx && draw->vtable->in_current_context(draw) && draw->vtable->flush_drawable_with_fence_fd) {
-         dri2_blit_image(ctx,s->image,buffer->image,0,0,g->width,g->height,0,0,g->width,g->height,__BLIT_FLAG_FLUSH);
-         int64_t resolved = os_time_get();
-         resolve_us = resolved - submit_started;
-         fd=draw->vtable->flush_drawable_with_fence_fd(draw,flush_flags);
-         export_us = os_time_get() - resolved;
-         if (fd < 0)
-            dri2_blit_image(ctx,s->image,buffer->image,0,0,g->width,g->height,0,0,g->width,g->height,__BLIT_FLAG_FINISH);
+         struct hdmi_pipe_resolve_args args = {
+            .ctx=ctx, .dst=s->image, .src=buffer->image,
+            .width=g->width, .height=g->height,
+         };
+         fd=dri_flush_with_fence_fd_and_callback(ctx,draw->dri_drawable,
+               flush_flags,__DRI2_THROTTLE_SWAPBUFFER,
+               hdmi_pipe_resolve_before_flush,&args);
+         if (args.finished_us) {
+            prepare_us = args.started_us - submit_started;
+            resolve_us = args.finished_us - args.started_us;
+            export_us = os_time_get() - args.finished_us;
+         } else if (fd >= 0) {
+            close(fd); fd=-1;
+         }
       }
    }
    if (s->integrated) integrated_submit_us=os_time_get()-submit_started;
@@ -595,6 +624,7 @@ hdmi_pipe_present(struct loader_dri3_drawable *draw, struct loader_dri3_buffer *
    if (s->integrated) {
       hdmi_pipe_time(p, HDMI_RESOLVE_SUBMIT, resolve_us);
       hdmi_pipe_time(p, HDMI_FENCE_EXPORT, export_us);
+      hdmi_pipe_time(p, HDMI_DRAWABLE_PREPARE, prepare_us);
    }
    s->fence_fd=fd; s->phase=HDMI_PRODUCER; s->started_ns=os_time_get();
    if (fd < 0) { p_atomic_set(&p->failed,true); hdmi_pipe_release_source(p,s); s->phase=HDMI_FREE; }
@@ -636,7 +666,7 @@ hdmi_pipe_fini(struct loader_dri3_drawable *draw)
    mesa_logi("DRI3: HDMI resize generations=%" PRIu64 " cache_hits=%" PRIu64 " evictions=%" PRIu64,
              p->generation, p->cache_hits, p->cache_evictions);
    static const char *names[] = {"admission_lock", "generation_wait", "allocate_import",
-      "generation_retire", "slot_wait", "resolve_submit", "fence_export"};
+      "generation_retire", "slot_wait", "resolve_submit", "fence_export", "drawable_prepare"};
    for (unsigned i=0; i<ARRAY_SIZE(names); i++) {
       uint64_t cumulative=0, percentile=0, threshold=(p->timing[i].count*95+99)/100;
       for (unsigned b=0; b<32 && threshold; b++) {
