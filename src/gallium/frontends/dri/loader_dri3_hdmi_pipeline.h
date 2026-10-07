@@ -19,7 +19,7 @@ struct hdmi_pipe_slot {
    int fence_fd, interval;
    uint32_t serial;
    uint64_t order, sbc;
-   bool completed, idle, integrated;
+   bool completed, idle, integrated, low_latency;
    int64_t started_ns;
 };
 struct hdmi_pipe_generation {
@@ -39,7 +39,7 @@ struct hdmi_pipe {
    thrd_t worker, retire_worker;
    int wake_fd, stop;
    int failed;
-   bool primed, threads_started;
+   bool primed, threads_started, low_latency;
    uint64_t msc, target_msc, generation, submitted, copied, resolved, completed, accepted, next_order;
    uint64_t producer_us, submit_us, gpu_us, mutex_us;
    uint64_t cache_clock, cache_hits, cache_evictions;
@@ -362,6 +362,34 @@ hdmi_pipe_fence_status(int fd)
    return info.status > 0 ? 1 : -1;
 }
 
+/* Admission latency is independent of the resize cache's storage budget.
+ * Count even completed-but-not-idle slots: the consumer still owns them. */
+static unsigned
+hdmi_pipe_outstanding(const struct hdmi_pipe *p)
+{
+   unsigned count = 0;
+   for (unsigned g = 0; g < HDMI_PIPE_GENERATIONS; g++)
+      for (unsigned i = 0; i < HDMI_PIPE_SLOTS; i++)
+         count += p->generations[g].slots[i].phase != HDMI_FREE;
+   return count;
+}
+
+static bool
+hdmi_pipe_can_submit(const struct hdmi_pipe *p, const struct hdmi_pipe_slot *next)
+{
+   if (!next->low_latency)
+      return !(p->submitted && !p->primed && next->interval > 0);
+   /* A target-zero request must not overtake a previously scheduled request
+    * when an application changes interval or mixes swap APIs. */
+   for (unsigned g = 0; g < HDMI_PIPE_GENERATIONS; g++)
+      for (unsigned i = 0; i < HDMI_PIPE_SLOTS; i++) {
+         const struct hdmi_pipe_slot *s = &p->generations[g].slots[i];
+         if (s->phase == HDMI_PRESENTED && !s->low_latency)
+            return false;
+      }
+   return true;
+}
+
 static int
 hdmi_pipe_thread(void *data)
 {
@@ -431,9 +459,9 @@ hdmi_pipe_thread(void *data)
          }
          if (!next || next->phase != HDMI_READY) break;
          if (p_atomic_read(&p->failed) || p_atomic_read(&p->stop)) { next->phase=HDMI_FREE; p->next_order++; continue; }
-         if (p->submitted && !p->primed && next->interval > 0) break;
-         uint64_t target=p->primed ? p->target_msc : 0;
-         if (p->primed) p->target_msc += MAX2(abs(next->interval),1);
+         if (!hdmi_pipe_can_submit(p, next)) break;
+         uint64_t target=next->low_latency ? 0 : (p->primed ? p->target_msc : 0);
+         if (!next->low_latency && p->primed) p->target_msc += MAX2(abs(next->interval),1);
          next->serial=++p->serial; next->completed=next->idle=false;
          next->phase=HDMI_PRESENTED; p->submitted++; p->next_order++;
          uint32_t options=next->interval <= 0 ? XCB_PRESENT_OPTION_ASYNC : XCB_PRESENT_OPTION_NONE;
@@ -461,6 +489,11 @@ hdmi_pipe_init(struct loader_dri3_drawable *draw)
    if (draw->hdmi_pipeline) return true;
    struct hdmi_pipe *p = calloc(1,sizeof(*p));
    if (!p) return false;
+   const char *queue = getenv("MESA_KGSL_HDMI_QUEUE");
+   if (queue && strcmp(queue, "fifo") && strcmp(queue, "low-latency")) {
+      mesa_loge("DRI3: invalid MESA_KGSL_HDMI_QUEUE"); free(p); return false;
+   }
+   p->low_latency = queue && !strcmp(queue, "low-latency");
    p->draw = draw; p->next_order=1;
    p->wake_fd = eventfd(0,EFD_CLOEXEC|EFD_NONBLOCK);
    if (p->wake_fd < 0) { free(p); return false; }
@@ -488,6 +521,7 @@ hdmi_pipe_init(struct loader_dri3_drawable *draw)
    mesa_logi("DRI3: HDMI_LOS_MESA_PIPELINE_ABI=1 persistent GPU pipeline; resolve=%s",
              draw->hdmi_pipeline_resolve ? "application-context" : "worker-context");
    mesa_logi("DRI3: HDMI_LOS_MESA_RESIZE_ABI=1 bounded size cache; separate allocation connection");
+   mesa_logi("DRI3: HDMI_LOS_MESA_QUEUE_ABI=1 queue=%s", p->low_latency ? "low-latency" : "fifo");
    return true;
 fail:
    draw->hdmi_pipeline = NULL;
@@ -500,7 +534,7 @@ fail:
 
 static bool
 hdmi_pipe_present(struct loader_dri3_drawable *draw, struct loader_dri3_buffer *buffer,
-                  int producer_fd, unsigned flush_flags)
+                  int producer_fd, unsigned flush_flags, bool ordinary_swap)
 {
    if (!hdmi_pipe_init(draw)) { if (producer_fd >= 0) close(producer_fd); return false; }
    struct hdmi_pipe *p = draw->hdmi_pipeline;
@@ -508,6 +542,13 @@ hdmi_pipe_present(struct loader_dri3_drawable *draw, struct loader_dri3_buffer *
    mtx_lock(&p->admission_lock);
    mtx_lock(&p->lock);
    hdmi_pipe_time(p, HDMI_LOCK, os_time_get() - lock_started);
+   bool low_latency = p->low_latency && ordinary_swap && draw->swap_interval == 0;
+   while (low_latency && hdmi_pipe_outstanding(p) >= 2 &&
+          !p_atomic_read(&p->failed) && !p_atomic_read(&p->stop)) {
+      int64_t waited = os_time_get();
+      cnd_wait(&p->changed, &p->lock);
+      hdmi_pipe_time(p, HDMI_SLOT_WAIT, os_time_get() - waited);
+   }
    struct hdmi_pipe_generation *g = hdmi_pipe_generation(p,buffer);
    struct hdmi_pipe_slot *s = NULL;
    while (g && !p_atomic_read(&p->failed) && !p_atomic_read(&p->stop)) {
@@ -519,6 +560,7 @@ hdmi_pipe_present(struct loader_dri3_drawable *draw, struct loader_dri3_buffer *
    }
    if (!s) { mtx_unlock(&p->lock); mtx_unlock(&p->admission_lock); if (producer_fd >= 0) close(producer_fd); return false; }
    s->source=buffer; s->interval=draw->swap_interval; s->integrated=draw->hdmi_pipeline_resolve;
+   s->low_latency=low_latency;
    p_atomic_inc(&buffer->pipeline_refs);
    /* Reserve before releasing the generation lock for application submission. */
    s->phase=HDMI_RESERVED; s->fence_fd=-1; s->order=++p->accepted; s->started_ns=os_time_get();

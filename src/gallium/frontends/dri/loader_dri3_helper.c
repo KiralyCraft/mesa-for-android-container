@@ -2566,7 +2566,8 @@ loader_dri3_swap_buffers_msc(struct loader_dri3_drawable *draw,
 
    bool bridge_presented = false;
    if (draw->hdmi_pipeline_enabled) {
-      bridge_presented=hdmi_pipe_present(draw,back,render_fence_fd,flush_flags);
+      bridge_presented=hdmi_pipe_present(draw,back,render_fence_fd,flush_flags,
+                                       target_msc == 0 && divisor == 0 && remainder == 0 && !force_copy);
       render_fence_fd=-1;
       if (!bridge_presented) {
          mesa_loge("DRI3: HDMI pipeline failed; accelerated Present rejected");
