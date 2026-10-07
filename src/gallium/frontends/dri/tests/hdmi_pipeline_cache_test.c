@@ -12,6 +12,8 @@
 #include <threads.h>
 #include <sys/mman.h>
 #define MAX2(a,b) ((a) > (b) ? (a) : (b))
+#define MIN2(a,b) ((a) < (b) ? (a) : (b))
+#define ALIGN_POT(v,a) (((v)+(a)-1)&~((a)-1))
 #define p_atomic_read(p) __atomic_load_n(p,__ATOMIC_SEQ_CST)
 #define p_atomic_set(p,v) __atomic_store_n(p,v,__ATOMIC_SEQ_CST)
 #define p_atomic_dec_return(p) __atomic_sub_fetch(p,1,__ATOMIC_SEQ_CST)
@@ -22,12 +24,14 @@
 #define __DRI_IMAGE_ATTRIB_FD 3
 #define FORMAT 0x34325258
 struct hdmi_pipe;
+typedef struct { unsigned width_in_pixels,height_in_pixels; } xcb_screen_t;
 struct dri_image { unsigned width,height; uint64_t bytes; };
 struct loader_dri3_buffer { struct dri_image *image; unsigned width,height,cpp; int pipeline_refs; };
-struct loader_dri3_drawable { struct hdmi_pipe *hdmi_pipeline; unsigned depth,drawable; void *dri_screen_render_gpu; bool multiplanes_available; };
+struct loader_dri3_drawable { struct hdmi_pipe *hdmi_pipeline; xcb_screen_t *screen; unsigned depth,drawable; void *dri_screen_render_gpu; bool multiplanes_available; };
 typedef struct { int tag; } xcb_connection_t;
 typedef void xcb_special_event_t;
 typedef unsigned xcb_pixmap_t;
+typedef unsigned xcb_xfixes_region_t;
 typedef unsigned xcb_present_event_t;
 typedef struct { int error_code; } xcb_generic_error_t;
 static xcb_connection_t allocation={1}, events={2};
@@ -40,10 +44,11 @@ static int checked_wait(cnd_t *c,mtx_t *m) { assert(m==event_lock&&owns_event);o
 #define mtx_unlock checked_unlock
 #define cnd_wait checked_wait
 static int64_t os_time_get(void) { struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec*INT64_C(1000000)+t.tv_nsec/1000; }
-static unsigned next_id, live_pixmaps, live_images, created, destroyed;
-static int fail_create, fail_import, create_pending_error;
+static unsigned next_id, live_pixmaps, live_images, live_regions, created, destroyed;
+static int fail_create, fail_import, fail_region, create_pending_error;
 static uint64_t padded_bytes;
 static struct { unsigned w,h;bool live; } pixmaps[4096];
+static bool regions[4096];
 static void check_external(xcb_connection_t *c) { assert(c==&allocation);assert(!owns_event); }
 static unsigned xcb_generate_id(xcb_connection_t *c) {check_external(c);assert(++next_id<4096);return next_id;}
 static int xcb_create_pixmap_checked(xcb_connection_t *c,unsigned depth,unsigned id,unsigned win,unsigned w,unsigned h) {
@@ -55,6 +60,14 @@ static xcb_generic_error_t *xcb_request_check(xcb_connection_t *c,int cookie) {
  (void)cookie;check_external(c);if(!create_pending_error)return NULL;create_pending_error=0;return calloc(1,sizeof(xcb_generic_error_t));
 }
 static void xcb_free_pixmap(xcb_connection_t *c,unsigned id) {check_external(c);assert(pixmaps[id].live);pixmaps[id].live=false;live_pixmaps--;destroyed++;}
+static int xcb_xfixes_create_region_checked(xcb_connection_t *c,unsigned id,unsigned count,void *rects) {
+ check_external(c);assert(!count&&!rects);
+ if(fail_region){fail_region=0;create_pending_error=1;return 0;}
+ assert(!regions[id]);regions[id]=true;live_regions++;return 0;
+}
+static void xcb_xfixes_destroy_region(xcb_connection_t *c,unsigned id) {
+ check_external(c);assert(regions[id]);regions[id]=false;live_regions--;
+}
 static void xcb_flush(xcb_connection_t *c) {check_external(c);}
 static struct dri_image *loader_dri3_get_pixmap_buffer(xcb_connection_t *c,unsigned id,void *screen,unsigned fourcc,bool multi,int *w,int *h,void *unused) {
  (void)screen;(void)multi;(void)unused;check_external(c);assert(fourcc==FORMAT);
@@ -80,7 +93,7 @@ static void init(struct hdmi_pipe *p,struct loader_dri3_drawable *d) {
 static void fini(struct hdmi_pipe *p) {
  mtx_lock(&p->lock);p->retire_stop=true;cnd_broadcast(&p->changed);mtx_unlock(&p->lock);thrd_join(p->retire_worker,NULL);
  for(unsigned i=0;i<HDMI_PIPE_GENERATIONS;i++)hdmi_pipe_destroy_generation(p,&p->generations[i]);
- cnd_destroy(&p->changed);mtx_destroy(&p->lock);mtx_destroy(&p->admission_lock);event_lock=NULL;assert(!live_images&&!live_pixmaps);
+ cnd_destroy(&p->changed);mtx_destroy(&p->lock);mtx_destroy(&p->admission_lock);event_lock=NULL;assert(!live_images&&!live_pixmaps&&!live_regions);
 }
 static struct hdmi_pipe_generation *admit(struct hdmi_pipe *p,unsigned w,unsigned h) {
  struct dri_image image={.width=w,.height=h};struct loader_dri3_buffer b={.image=&image,.width=w,.height=h,.cpp=4};
@@ -113,5 +126,32 @@ int main(void) {
  init(&p,&d);fail_create=1;assert(!admit(&p,10,10));assert(!live_pixmaps&&!live_images);
  fail_import=1;assert(!admit(&p,10,10));assert(!live_pixmaps&&!live_images);assert(admit(&p,10,10));fini(&p);
  wait_test(false);wait_test(true);
- assert(created==destroyed);puts("PASS: production cache reuse, bounded padded allocations, busy pinning, event-lock freedom, retirement, failure cleanup, wait and stop");
+ /* Logical sizes within a capacity share storage, including while a previous
+  * frame pins a slot. Their image geometry stays immutable. */
+ init(&p,&d);p.resize_capacity=true;
+ struct hdmi_pipe_generation *capacity=admit(&p,641,479);
+ assert(capacity&&capacity->width==768&&capacity->height==512&&live_regions==3);
+ capacity->slots[0].phase=HDMI_PRESENTED;
+ uint64_t identity=capacity->identity;
+ for(unsigned i=0;i<100;i++) {
+  struct hdmi_pipe_generation *g=admit(&p,641+i,479+i%30);
+  assert(g==capacity&&g->identity==identity&&g->width==768&&g->height==512);
+ }
+ assert(p.generation==1&&p.capacity_reuses==100&&p.cache_evictions==0);
+ assert(admit(&p,769,513)->identity!=identity);
+ assert(capacity->identity==identity&&capacity->slots[0].phase==HDMI_PRESENTED);
+ fini(&p);
+ /* Preserve an exact fullscreen allocation instead of reusing a padded
+  * windowed capacity that would prevent scanout eligibility. */
+ xcb_screen_t screen={3840,2160};d.screen=&screen;
+ init(&p,&d);p.resize_capacity=true;
+ struct hdmi_pipe_generation *windowed=admit(&p,3839,2159);
+ identity=windowed->identity;assert(windowed->width==3840&&windowed->height==2176);
+ struct hdmi_pipe_generation *fullscreen=admit(&p,3840,2160);
+ assert(fullscreen->identity!=identity&&fullscreen->width==3840&&fullscreen->height==2160);
+ assert(admit(&p,3838,2158)->identity==identity);fini(&p);d.screen=NULL;
+ init(&p,&d);p.resize_capacity=true;fail_region=1;
+ assert(!admit(&p,641,479));assert(!live_pixmaps&&!live_images&&!live_regions);
+ assert(admit(&p,641,479));fini(&p);
+ assert(created==destroyed);puts("PASS: production cache reuse, bounded padded allocations, busy pinning, event-lock freedom, retirement, failure cleanup, wait and stop; logical resize capacity, exact fullscreen and region lifetime");
 }
