@@ -10,6 +10,8 @@
 #define HDMI_PIPE_BYTES (512ULL * 1024 * 1024)
 #define HDMI_PIPE_RETIRE 16
 #define HDMI_PIPE_CAPACITY_ALIGN 128
+/* Private capability advertised only by a fence-gated KGSL Xorg exporter. */
+#define HDMI_PRESENT_CAP_FENCE_GATED_EXPORT 0x08000000u
 
 enum hdmi_pipe_phase { HDMI_FREE, HDMI_RESERVED, HDMI_PRODUCER, HDMI_COPY, HDMI_READY, HDMI_PRESENTED, HDMI_QUARANTINED };
 struct hdmi_pipe_slot {
@@ -534,7 +536,7 @@ hdmi_pipe_init(struct loader_dri3_drawable *draw)
       mesa_loge("DRI3: invalid MESA_KGSL_HDMI_QUEUE"); free(p); return false;
    }
    p->low_latency = queue && !strcmp(queue, "low-latency");
-   p->resize_capacity = debug_get_bool_option("MESA_KGSL_HDMI_RESIZE_CAPACITY", false);
+   p->resize_capacity = debug_get_bool_option("MESA_KGSL_HDMI_RESIZE_CAPACITY", true);
    p->draw = draw; p->next_order=1;
    p->wake_fd = eventfd(0,EFD_CLOEXEC|EFD_NONBLOCK);
    if (p->wake_fd < 0) { free(p); return false; }
@@ -545,6 +547,16 @@ hdmi_pipe_init(struct loader_dri3_drawable *draw)
    if (!p->conn || xcb_connection_has_error(p->conn)) goto fail;
    p->allocation_conn = xcb_connect(NULL,NULL);
    if (!p->allocation_conn || xcb_connection_has_error(p->allocation_conn)) goto fail;
+   xcb_present_query_capabilities_reply_t *capabilities = xcb_present_query_capabilities_reply(
+      p->conn, xcb_present_query_capabilities(p->conn, draw->drawable), NULL);
+   bool export_ready = capabilities &&
+      (capabilities->capabilities & HDMI_PRESENT_CAP_FENCE_GATED_EXPORT);
+   free(capabilities);
+   if (!export_ready &&
+       !debug_get_bool_option("MESA_KGSL_HDMI_ALLOC_READBACK_CONTROL", false)) {
+      mesa_loge("DRI3: HDMI pipeline requires fence-gated Xorg pixmap exports; refusing an unsafe buffer handoff");
+      goto fail;
+   }
    if (p->resize_capacity) {
       xcb_connection_t *connections[] = {p->conn, p->allocation_conn};
       for (unsigned i = 0; i < ARRAY_SIZE(connections); i++) {
