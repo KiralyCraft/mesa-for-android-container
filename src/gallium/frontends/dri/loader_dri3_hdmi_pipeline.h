@@ -417,6 +417,24 @@ hdmi_pipe_outstanding(const struct hdmi_pipe *p)
    return count;
 }
 
+/* Presentation latency and storage retirement have different lifetimes. A
+ * completed fullscreen flip keeps its buffer until a replacement flips in.
+ * It must not prevent producing that replacement; the nonfree slot still pins
+ * storage and generation eviction until the real IDLE notification arrives.
+ */
+static unsigned
+hdmi_pipe_pending(const struct hdmi_pipe *p)
+{
+   unsigned count = 0;
+   for (unsigned g = 0; g < HDMI_PIPE_GENERATIONS; g++)
+      for (unsigned i = 0; i < HDMI_PIPE_SLOTS; i++) {
+         const struct hdmi_pipe_slot *s = &p->generations[g].slots[i];
+         count += s->phase != HDMI_FREE &&
+                  !(s->phase == HDMI_PRESENTED && s->completed);
+      }
+   return count;
+}
+
 static bool
 hdmi_pipe_can_submit(const struct hdmi_pipe *p, const struct hdmi_pipe_slot *next)
 {
@@ -427,7 +445,7 @@ hdmi_pipe_can_submit(const struct hdmi_pipe *p, const struct hdmi_pipe_slot *nex
    for (unsigned g = 0; g < HDMI_PIPE_GENERATIONS; g++)
       for (unsigned i = 0; i < HDMI_PIPE_SLOTS; i++) {
          const struct hdmi_pipe_slot *s = &p->generations[g].slots[i];
-         if (s->phase == HDMI_PRESENTED && !s->low_latency)
+         if (s->phase == HDMI_PRESENTED && !s->low_latency && !s->completed)
             return false;
       }
    return true;
@@ -662,7 +680,8 @@ hdmi_pipe_present(struct loader_dri3_drawable *draw, struct loader_dri3_buffer *
    hdmi_pipe_time(p, HDMI_LOCK, os_time_get() - lock_started);
    bool low_latency = p->low_latency && ordinary_swap && draw->swap_interval == 0;
    unsigned admission_budget = hdmi_pipe_admission_budget(p, ordinary_swap, draw->swap_interval);
-   while (admission_budget && hdmi_pipe_outstanding(p) >= admission_budget &&
+   while (admission_budget &&
+          (low_latency ? hdmi_pipe_outstanding(p) : hdmi_pipe_pending(p)) >= admission_budget &&
           !p_atomic_read(&p->failed) && !p_atomic_read(&p->stop)) {
       int64_t waited = os_time_get();
       cnd_wait(&p->changed, &p->lock);
