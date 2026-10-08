@@ -845,12 +845,14 @@ hdmi_pipe_present(struct loader_dri3_drawable *draw, struct loader_dri3_buffer *
       mtx_lock(&draw->mtx);
       s->sbc=++draw->send_sbc; buffer->last_swap=s->sbc;
       if (draw->stamp) ++(*draw->stamp);
-      /* EGL_BUFFER_PRESERVED requires the next render image to retain this
-       * frame. Reuse the ordinary loader's copy-back path before advancing
-       * the ring; source/consumer fences still govern buffer ownership. */
+      /* Match the ordinary loader's preserved-swap semantics: keep this
+       * render buffer selected and let dri3_find_back wait for its producer
+       * read to finish. Advancing to an unallocated or busy slot can clear
+       * cur_blit_source before a copy-back, losing preserved contents. */
       if (preserve_back)
          draw->cur_blit_source = LOADER_DRI3_BACK_ID(draw->cur_back);
-      draw->cur_back=(draw->cur_back+1)%draw->max_num_back;
+      else
+         draw->cur_back=(draw->cur_back+1)%draw->max_num_back;
       mtx_unlock(&draw->mtx);
    }
    mtx_lock(&p->lock);
