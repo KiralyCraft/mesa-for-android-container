@@ -44,7 +44,9 @@ struct hdmi_pipe {
    thrd_t worker, retire_worker;
    int wake_fd, stop;
    int failed;
-   bool primed, threads_started, low_latency, resize_capacity;
+   bool primed, threads_started, low_latency, resize_capacity, binding_diagnostic;
+   bool logged_binding;
+   uint64_t binding_checks, binding_mismatches;
    unsigned paced_queue, paced_lead;
    uint64_t msc, target_msc, generation, submitted, copied, resolved, completed, accepted, next_order;
    uint64_t producer_us, submit_us, gpu_us, mutex_us;
@@ -585,6 +587,7 @@ hdmi_pipe_init(struct loader_dri3_drawable *draw)
    }
    p->paced_queue = paced_queue; p->paced_lead = paced_lead;
    p->resize_capacity = debug_get_bool_option("MESA_KGSL_HDMI_RESIZE_CAPACITY", true);
+   p->binding_diagnostic = debug_get_bool_option("MESA_KGSL_HDMI_BINDING_DIAGNOSTIC", false);
    p->draw = draw; p->next_order=1;
    p->wake_fd = eventfd(0,EFD_CLOEXEC|EFD_NONBLOCK);
    if (p->wake_fd < 0) { free(p); return false; }
@@ -653,6 +656,9 @@ fail:
 struct hdmi_pipe_resolve_args {
    struct dri_context *ctx;
    struct dri_image *dst, *src;
+   struct dri_drawable *drawable;
+   bool diagnostic, source_matches;
+   unsigned actual_width, actual_height;
    unsigned width, height;
    int64_t started_us, finished_us;
 };
@@ -662,6 +668,12 @@ hdmi_pipe_resolve_before_flush(void *data)
 {
    struct hdmi_pipe_resolve_args *args = data;
    args->started_us = os_time_get();
+   if (args->diagnostic) {
+      struct pipe_resource *actual = args->drawable->textures[ST_ATTACHMENT_BACK_LEFT];
+      args->source_matches = actual == args->src->texture;
+      args->actual_width = actual ? actual->width0 : 0;
+      args->actual_height = actual ? actual->height0 : 0;
+   }
    /* dri_flush's callback runs after vertices/bitmap/MSAA/HUD work. Do not
     * recursively flush here: the enclosing end-of-frame flush exports one
     * fence covering rendering and the final resolve into shared storage. */
@@ -719,11 +731,22 @@ hdmi_pipe_present(struct loader_dri3_drawable *draw, struct loader_dri3_buffer *
       if (ctx && draw->vtable->in_current_context(draw) && draw->vtable->flush_drawable_with_fence_fd) {
          struct hdmi_pipe_resolve_args args = {
             .ctx=ctx, .dst=s->image, .src=buffer->image,
+            .drawable=draw->dri_drawable, .diagnostic=p->binding_diagnostic,
             .width=s->width, .height=s->height,
          };
          fd=dri_flush_with_fence_fd_and_callback(ctx,draw->dri_drawable,
                flush_flags,__DRI2_THROTTLE_SWAPBUFFER,
                hdmi_pipe_resolve_before_flush,&args);
+         if (args.finished_us && args.diagnostic) {
+            p->binding_checks++;
+            p->binding_mismatches += !args.source_matches;
+            if (!p->logged_binding || (!args.source_matches && p->binding_mismatches <= 4)) {
+               mesa_logi("DRI3: HDMI resolve binding frame=%" PRIu64 " matches=%u source=%ux%u actual=%ux%u",
+                         s->order, args.source_matches, s->width, s->height,
+                         args.actual_width, args.actual_height);
+               p->logged_binding = true;
+            }
+         }
          if (args.finished_us) {
             prepare_us = args.started_us - submit_started;
             resolve_us = args.finished_us - args.started_us;
