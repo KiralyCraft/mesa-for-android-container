@@ -657,7 +657,7 @@ struct hdmi_pipe_resolve_args {
    struct dri_context *ctx;
    struct dri_image *dst, *src;
    struct dri_drawable *drawable;
-   bool diagnostic, source_matches;
+   bool diagnostic, source_matches, render_matches;
    unsigned actual_width, actual_height;
    unsigned width, height;
    int64_t started_us, finished_us;
@@ -671,6 +671,11 @@ hdmi_pipe_resolve_before_flush(void *data)
    if (args->diagnostic) {
       struct pipe_resource *actual = args->drawable->textures[ST_ATTACHMENT_BACK_LEFT];
       args->source_matches = actual == args->src->texture;
+      struct gl_framebuffer *fb = args->ctx->st->ctx->DrawBuffer;
+      struct pipe_resource *render = fb && fb->_ColorDrawBuffers[0] ?
+         fb->_ColorDrawBuffers[0]->texture : NULL;
+      args->render_matches = render == args->src->texture ||
+         render == args->drawable->msaa_textures[ST_ATTACHMENT_BACK_LEFT];
       args->actual_width = actual ? actual->width0 : 0;
       args->actual_height = actual ? actual->height0 : 0;
    }
@@ -739,10 +744,10 @@ hdmi_pipe_present(struct loader_dri3_drawable *draw, struct loader_dri3_buffer *
                hdmi_pipe_resolve_before_flush,&args);
          if (args.finished_us && args.diagnostic) {
             p->binding_checks++;
-            p->binding_mismatches += !args.source_matches;
-            if (!p->logged_binding || (!args.source_matches && p->binding_mismatches <= 4)) {
-               mesa_logi("DRI3: HDMI resolve binding frame=%" PRIu64 " matches=%u source=%ux%u actual=%ux%u",
-                         s->order, args.source_matches, s->width, s->height,
+            p->binding_mismatches += !args.source_matches || !args.render_matches;
+            if (!p->logged_binding || ((!args.source_matches || !args.render_matches) && p->binding_mismatches <= 4)) {
+               mesa_logi("DRI3: HDMI resolve binding frame=%" PRIu64 " matches=%u render_matches=%u source=%ux%u actual=%ux%u",
+                         s->order, args.source_matches, args.render_matches, s->width, s->height,
                          args.actual_width, args.actual_height);
                p->logged_binding = true;
             }
