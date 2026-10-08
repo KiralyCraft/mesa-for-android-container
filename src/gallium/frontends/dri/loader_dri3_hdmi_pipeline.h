@@ -578,8 +578,8 @@ hdmi_pipe_init(struct loader_dri3_drawable *draw)
       mesa_loge("DRI3: invalid MESA_KGSL_HDMI_QUEUE"); free(p); return false;
    }
    p->low_latency = queue && !strcmp(queue, "low-latency");
-   int paced_queue = debug_get_num_option("MESA_KGSL_HDMI_PACED_QUEUE", 0);
-   int paced_lead = debug_get_num_option("MESA_KGSL_HDMI_PACED_LEAD", 2);
+   int paced_queue = debug_get_num_option("MESA_KGSL_HDMI_PACED_QUEUE", p->low_latency ? 1 : 0);
+   int paced_lead = debug_get_num_option("MESA_KGSL_HDMI_PACED_LEAD", p->low_latency ? 1 : 2);
    if (paced_queue < 0 || paced_queue > HDMI_PIPE_SLOTS || paced_lead < 1 || paced_lead > 2) {
       mesa_loge("DRI3: invalid HDMI paced queue/lead"); free(p); return false;
    }
