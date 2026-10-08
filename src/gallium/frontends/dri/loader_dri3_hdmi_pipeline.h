@@ -52,7 +52,7 @@ struct hdmi_pipe {
    /* HDMI owns its clock and ledger. Never enable the Lorie capability path
     * or change the Termux:X11 pacer embedded in the drawable. */
    struct loader_dri3_pacer pacer;
-   bool paced_zero_active, pacing_stats;
+   bool pace_interval_zero, paced_zero_active, pacing_stats;
    unsigned paced_width, paced_height;
    uint64_t paced_submitted_order, paced_submitted_target;
    uint64_t msc, target_msc, generation, submitted, copied, resolved, completed, accepted, next_order;
@@ -539,6 +539,14 @@ hdmi_pipe_pending(const struct hdmi_pipe *p)
 }
 
 static bool
+hdmi_pipe_pacing_requested(const char *mode)
+{
+   /* The HDMI backend defaults to pacing; explicit environment selections
+    * retain their meaning. This does not change the generic Lorie default. */
+   return !mode || !strcmp(mode, "paced");
+}
+
+static bool
 hdmi_pipe_paced_zero(bool ordinary, int interval, bool requested)
 {
    return ordinary && interval == 0 && requested;
@@ -724,6 +732,7 @@ hdmi_pipe_init(struct loader_dri3_drawable *draw)
    }
    loader_dri3_pacer_init(&p->pacer, os_time_get());
    p->pacer.margin_us=margin;
+   p->pace_interval_zero=hdmi_pipe_pacing_requested(getenv("MESA_DRI3_PRESENT_MODE"));
    p->pacing_stats=debug_get_bool_option("MESA_KGSL_HDMI_PACER_STATS", false);
    p->resize_capacity = debug_get_bool_option("MESA_KGSL_HDMI_RESIZE_CAPACITY", true);
    p->lazy_slots = debug_get_bool_option("MESA_KGSL_HDMI_LAZY_SLOTS", true);
@@ -786,7 +795,7 @@ hdmi_pipe_init(struct loader_dri3_drawable *draw)
    mesa_logi("DRI3: HDMI_LOS_MESA_PACED_QUEUE_ABI=1 max_pending=%u re_prime_lead=%u",
              p->paced_queue, p->paced_lead);
    mesa_logi("DRI3: HDMI_LOS_MESA_PACER_ABI=1 interval_zero=%s margin_us=%" PRIu64,
-             draw->present_mode == LOADER_DRI3_PRESENT_PACED ? "paced" : "unpaced",
+             p->pace_interval_zero ? "paced" : "unpaced",
              p->pacer.margin_us);
    return true;
 fail:
@@ -847,7 +856,7 @@ hdmi_pipe_present(struct loader_dri3_drawable *draw, struct loader_dri3_buffer *
    mtx_lock(&p->lock);
    hdmi_pipe_time(p, HDMI_LOCK, os_time_get() - lock_started);
    bool paced_zero = hdmi_pipe_paced_zero(ordinary_swap, draw->swap_interval,
-                                        draw->present_mode == LOADER_DRI3_PRESENT_PACED);
+                                        p->pace_interval_zero);
    if (paced_zero != p->paced_zero_active ||
        (paced_zero && (p->paced_width != buffer->width || p->paced_height != buffer->height))) {
       loader_dri3_pacer_reset_generation(&p->pacer, os_time_get());

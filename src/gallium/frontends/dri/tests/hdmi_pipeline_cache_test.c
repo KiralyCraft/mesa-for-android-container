@@ -151,8 +151,14 @@ static void slot_wait_test(bool stop,bool budget) {
  fini(&p);padded_bytes=0;
 }
 int main(void) {
- /* Explicit HDMI opt-in only. Interval-one, OML scheduling, and ordinary
-  * unpaced interval-zero retain their existing policies. */
+ /* HDMI defaults to pacing, with explicit opt-out. The generic Lorie policy
+  * is untouched; interval-one and explicit OML scheduling remain unchanged. */
+ assert(hdmi_pipe_pacing_requested(NULL));
+ assert(hdmi_pipe_pacing_requested("paced"));
+ assert(!hdmi_pipe_pacing_requested("unpaced"));
+ assert(!hdmi_pipe_pacing_requested("queued"));
+ assert(!hdmi_pipe_pacing_requested("invalid"));
+ assert(!hdmi_pipe_pacing_requested(""));
  assert(hdmi_pipe_paced_zero(true,0,true));
  assert(!hdmi_pipe_paced_zero(true,0,false));
  assert(!hdmi_pipe_paced_zero(false,0,true));
