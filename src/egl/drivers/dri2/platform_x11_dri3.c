@@ -114,6 +114,19 @@ egl_dri3_flush_drawable_with_fence_fd(struct loader_dri3_drawable *draw,
       __DRI2_THROTTLE_SWAPBUFFER);
 }
 
+static int
+egl_dri3_flush_drawable_with_fence_fd_and_callback(
+   struct loader_dri3_drawable *draw, unsigned flags,
+   void (*after_drawable_cb)(void *), void *data)
+{
+   /* The EGL swap entry point supplies zero loader flags. Normalize them
+    * here, just as for the ordinary fenced EGL flush, so the final resolve
+    * follows drawable work and is covered by the outgoing native fence. */
+   return loader_dri3_flush_with_fence_fd_and_callback(
+      draw, __DRI2_FLUSH_DRAWABLE | __DRI2_FLUSH_INVALIDATE_ANCILLARY,
+      __DRI2_THROTTLE_SWAPBUFFER, after_drawable_cb, data);
+}
+
 static const struct loader_dri3_vtable egl_dri3_vtable = {
    .set_drawable_size = egl_dri3_set_drawable_size,
    .in_current_context = egl_dri3_in_current_context,
@@ -121,6 +134,8 @@ static const struct loader_dri3_vtable egl_dri3_vtable = {
    .get_dri_screen = egl_dri3_get_dri_screen,
    .flush_drawable = egl_dri3_flush_drawable,
    .flush_drawable_with_fence_fd = egl_dri3_flush_drawable_with_fence_fd,
+   .flush_drawable_with_fence_fd_and_callback =
+      egl_dri3_flush_drawable_with_fence_fd_and_callback,
 };
 
 static EGLBoolean

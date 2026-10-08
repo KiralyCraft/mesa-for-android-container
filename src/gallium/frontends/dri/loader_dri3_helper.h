@@ -134,6 +134,8 @@ struct loader_dri3_vtable {
    void (*flush_drawable)(struct loader_dri3_drawable *, unsigned);
    int (*flush_drawable_with_fence_fd)(struct loader_dri3_drawable *,
                                        unsigned);
+   int (*flush_drawable_with_fence_fd_and_callback)(
+      struct loader_dri3_drawable *, unsigned, void (*)(void *), void *);
 };
 
 #define LOADER_DRI3_NUM_BUFFERS (1 + LOADER_DRI3_MAX_BACK)
@@ -293,6 +295,12 @@ PUBLIC int
 loader_dri3_flush_with_fence_fd(struct loader_dri3_drawable *draw,
                                 unsigned flags,
                                 enum __DRI2throttleReason throttle_reason);
+
+PUBLIC int
+loader_dri3_flush_with_fence_fd_and_callback(
+   struct loader_dri3_drawable *draw, unsigned flags,
+   enum __DRI2throttleReason throttle_reason,
+   void (*after_drawable_cb)(void *), void *data);
 
 PUBLIC void
 loader_dri3_copy_sub_buffer(struct loader_dri3_drawable *draw,

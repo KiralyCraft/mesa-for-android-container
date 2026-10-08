@@ -144,6 +144,15 @@ glx_dri3_flush_drawable_with_fence_fd(struct loader_dri3_drawable *draw,
                                           __DRI2_THROTTLE_SWAPBUFFER);
 }
 
+static int
+glx_dri3_flush_drawable_with_fence_fd_and_callback(
+   struct loader_dri3_drawable *draw, unsigned flags,
+   void (*after_drawable_cb)(void *), void *data)
+{
+   return loader_dri3_flush_with_fence_fd_and_callback(
+      draw, flags, __DRI2_THROTTLE_SWAPBUFFER, after_drawable_cb, data);
+}
+
 static const struct loader_dri3_vtable glx_dri3_vtable = {
    .set_drawable_size = glx_dri3_set_drawable_size,
    .in_current_context = glx_dri3_in_current_context,
@@ -151,6 +160,8 @@ static const struct loader_dri3_vtable glx_dri3_vtable = {
    .get_dri_screen = glx_dri3_get_dri_screen,
    .flush_drawable = glx_dri3_flush_drawable,
    .flush_drawable_with_fence_fd = glx_dri3_flush_drawable_with_fence_fd,
+   .flush_drawable_with_fence_fd_and_callback =
+      glx_dri3_flush_drawable_with_fence_fd_and_callback,
 };
 
 

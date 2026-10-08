@@ -43,7 +43,7 @@ struct hdmi_pipe {
    cnd_t changed;
    thrd_t worker, retire_worker;
    int wake_fd, stop;
-   int failed;
+   int failed, failure_reported;
    bool primed, threads_started, low_latency, resize_capacity, lazy_slots, binding_diagnostic;
    bool logged_binding;
    uint64_t binding_checks, binding_mismatches;
@@ -724,6 +724,7 @@ hdmi_pipe_init(struct loader_dri3_drawable *draw)
    mesa_logi("DRI3: HDMI_LOS_MESA_CAPACITY_ABI=1 shared resize capacity=%u; logical valid/update regions",
              p->resize_capacity ? HDMI_PIPE_CAPACITY_ALIGN : 0);
    mesa_logi("DRI3: HDMI_LOS_MESA_SLOT_ABI=1 lazy_shared_slots=%u", p->lazy_slots);
+   mesa_logi("DRI3: HDMI_LOS_MESA_FRONTEND_FLUSH_ABI=1 frontend-normalized resolve and native fence");
    mesa_logi("DRI3: HDMI_LOS_MESA_QUEUE_ABI=1 queue=%s", p->low_latency ? "low-latency" : "fifo");
    mesa_logi("DRI3: HDMI_LOS_MESA_PACED_QUEUE_ABI=1 max_pending=%u re_prime_lead=%u",
              p->paced_queue, p->paced_lead);
@@ -810,15 +811,15 @@ hdmi_pipe_present(struct loader_dri3_drawable *draw, struct loader_dri3_buffer *
       struct dri_context *ctx=draw->vtable->get_dri_context(draw);
       if (producer_fd >= 0) close(producer_fd);
       fd=-1;
-      if (ctx && draw->vtable->in_current_context(draw) && draw->vtable->flush_drawable_with_fence_fd) {
+      if (ctx && draw->vtable->in_current_context(draw) &&
+          draw->vtable->flush_drawable_with_fence_fd_and_callback) {
          struct hdmi_pipe_resolve_args args = {
             .ctx=ctx, .dst=s->image, .src=buffer->image,
             .drawable=draw->dri_drawable, .diagnostic=p->binding_diagnostic,
             .width=s->width, .height=s->height,
          };
-         fd=dri_flush_with_fence_fd_and_callback(ctx,draw->dri_drawable,
-               flush_flags,__DRI2_THROTTLE_SWAPBUFFER,
-               hdmi_pipe_resolve_before_flush,&args);
+         fd=draw->vtable->flush_drawable_with_fence_fd_and_callback(
+               draw,flush_flags,hdmi_pipe_resolve_before_flush,&args);
          if (args.finished_us && args.diagnostic) {
             p->binding_checks++;
             p->binding_mismatches += !args.source_matches || !args.render_matches;

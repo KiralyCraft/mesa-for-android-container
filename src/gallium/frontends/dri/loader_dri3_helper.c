@@ -1682,7 +1682,10 @@ loader_dri3_drawable_init(xcb_connection_t *conn,
       debug_get_bool_option("MESA_KGSL_X11_PIPELINE",false);
    draw->hdmi_pipeline_resolve = draw->hdmi_pipeline_enabled &&
       debug_get_bool_option("MESA_KGSL_X11_INTEGRATED_RESOLVE",false);
-   if (draw->hdmi_pipeline_enabled && (!draw->shm_bridge || !vtable->flush_drawable_with_fence_fd)) {
+   if (draw->hdmi_pipeline_enabled &&
+       (!draw->shm_bridge || !vtable->flush_drawable_with_fence_fd ||
+        (draw->hdmi_pipeline_resolve &&
+         !vtable->flush_drawable_with_fence_fd_and_callback))) {
       mesa_loge("DRI3: HDMI pipeline requires the accelerated bridge and native producer fences");
       return 1;
    }
@@ -2278,6 +2281,21 @@ loader_dri3_flush_with_fence_fd(struct loader_dri3_drawable *draw,
                                   throttle_reason);
 }
 
+int
+loader_dri3_flush_with_fence_fd_and_callback(
+   struct loader_dri3_drawable *draw, unsigned flags,
+   enum __DRI2throttleReason throttle_reason,
+   void (*after_drawable_cb)(void *), void *data)
+{
+   struct dri_context *ctx = draw->vtable->get_dri_context(draw);
+
+   if (!ctx)
+      return -1;
+
+   return dri_flush_with_fence_fd_and_callback(
+      ctx, draw->dri_drawable, flags, throttle_reason, after_drawable_cb, data);
+}
+
 void
 loader_dri3_copy_sub_buffer(struct loader_dri3_drawable *draw,
                             int x, int y,
@@ -2575,8 +2593,12 @@ loader_dri3_swap_buffers_msc(struct loader_dri3_drawable *draw,
                                        target_msc == 0 && divisor == 0 && remainder == 0 && !force_copy);
       render_fence_fd=-1;
       if (!bridge_presented) {
-         mesa_loge("DRI3: HDMI pipeline failed; accelerated Present rejected");
-         return ret;
+         struct hdmi_pipe *p = draw->hdmi_pipeline;
+         if (!p || p_atomic_cmpxchg(&p->failure_reported, 0, 1) == 0)
+            mesa_loge("DRI3: HDMI pipeline failed; accelerated Present rejected");
+         /* EGL must not acknowledge a swap whose image was rejected. GLX's
+          * OML interface also uses the negative result to report failure. */
+         return -1;
       }
    }
    if (!draw->hdmi_pipeline_enabled && draw->shm_bridge && draw->type == LOADER_DRI3_DRAWABLE_WINDOW) {
