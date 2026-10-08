@@ -39,6 +39,7 @@
 #include "util/u_inlines.h"
 
 #include "state_tracker/st_context.h"
+#include "main/context.h"
 
 static uint32_t drifb_ID = 0;
 
@@ -466,6 +467,20 @@ notify_before_flush_cb(void* _args)
  * \param flags             a combination of _DRI2_FLUSH_xxx flags
  * \param throttle_reason   the reason for throttling, 0 = no throttling
  */
+/* Complete CPU-side GL work against its existing render attachments before
+ * the loader can consume resize events or choose another back buffer. This
+ * neither submits the Gallium context nor waits for GPU execution; MSAA/HUD,
+ * the integrated resolve and the one final native fence remain in dri_flush.
+ */
+void
+dri_prepare_drawable_for_swap(struct dri_context *ctx)
+{
+   if (!ctx)
+      return;
+   _mesa_glthread_finish(ctx->st->ctx);
+   FLUSH_VERTICES(ctx->st->ctx, 0, 0);
+}
+
 static int
 dri_flush_impl(struct dri_context *ctx,
                struct dri_drawable *drawable,

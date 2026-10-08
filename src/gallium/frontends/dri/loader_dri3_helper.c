@@ -2531,7 +2531,20 @@ loader_dri3_swap_buffers_msc(struct loader_dri3_drawable *draw,
          producer_ready_observed_us = os_time_get();
    }
 
-   back = dri3_find_back_alloc(draw);
+   if (draw->hdmi_pipeline_resolve &&
+       debug_get_bool_option("MESA_KGSL_HDMI_PREPARE_CONTROL", false)) {
+      struct dri_context *ctx = draw->vtable->get_dri_context(draw);
+      if (ctx && draw->vtable->in_current_context(draw))
+         dri_prepare_drawable_for_swap(ctx);
+      /* Preserve the buffer actually rendered, without consuming a new
+       * ConfigureNotify between glClear and queued vertex execution. Geometry
+       * is handled when obtaining attachments for the next rendering frame. */
+      back = dri3_back_buffer(draw);
+      if (!back)
+         back = dri3_find_back_alloc(draw);
+   } else {
+      back = dri3_find_back_alloc(draw);
+   }
    /* Could only happen when error case, like display is already closed. */
    if (!back) {
       if (render_fence_fd >= 0)

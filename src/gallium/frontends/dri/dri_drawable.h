@@ -153,6 +153,9 @@ dri_pipe_blit(struct pipe_context *pipe,
               struct pipe_resource *src);
 
 void
+dri_prepare_drawable_for_swap(struct dri_context *ctx);
+
+void
 dri_flush(struct dri_context *ctx,
           struct dri_drawable *drawable,
           unsigned flags,
