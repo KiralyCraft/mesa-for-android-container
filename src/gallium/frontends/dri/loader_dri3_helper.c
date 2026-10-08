@@ -557,7 +557,9 @@ dri3_shm_bridge_drain_events(struct loader_dri3_drawable *draw)
    while ((event = xcb_poll_for_special_event(draw->shm_bridge_conn,
                                                state->present_event)))
       dri3_shm_bridge_handle_present_event(draw, (void *) event);
-   while ((event = xcb_poll_for_event(draw->shm_bridge_conn)))
+   /* Do not read the socket again after checking the special queue: that can
+    * strand a newly arrived Present event behind the following poll(). */
+   while ((event = xcb_poll_for_queued_event(draw->shm_bridge_conn)))
       dri3_shm_bridge_handle_event(draw, event);
    return !xcb_connection_has_error(draw->shm_bridge_conn);
 }

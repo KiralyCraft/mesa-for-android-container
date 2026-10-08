@@ -354,7 +354,11 @@ hdmi_pipe_events(struct hdmi_pipe *p)
       }
       free(event);
    }
-   while ((event = xcb_poll_for_event(p->conn))) {
+   /* The special-event poll above is the only socket reader. A later general
+    * poll_for_event can read a newly arrived Present notification into XCB's
+    * special queue, leaving the socket empty just before the worker sleeps.
+    * Drain queued general errors without consuming new socket data here. */
+   while ((event = xcb_poll_for_queued_event(p->conn))) {
       if (!(event->response_type & 0x7f)) {
          mesa_loge("DRI3: HDMI pipeline X error %u", ((xcb_generic_error_t *)event)->error_code);
          p_atomic_set(&p->failed, true);
