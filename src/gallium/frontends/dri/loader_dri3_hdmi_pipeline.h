@@ -776,7 +776,8 @@ hdmi_pipe_resolve_before_flush(void *data)
 
 static bool
 hdmi_pipe_present(struct loader_dri3_drawable *draw, struct loader_dri3_buffer *buffer,
-                  int producer_fd, unsigned flush_flags, bool ordinary_swap)
+                  int producer_fd, unsigned flush_flags, bool ordinary_swap,
+                  bool preserve_back)
 {
    if (!hdmi_pipe_init(draw)) { if (producer_fd >= 0) close(producer_fd); return false; }
    struct hdmi_pipe *p = draw->hdmi_pipeline;
@@ -844,6 +845,11 @@ hdmi_pipe_present(struct loader_dri3_drawable *draw, struct loader_dri3_buffer *
       mtx_lock(&draw->mtx);
       s->sbc=++draw->send_sbc; buffer->last_swap=s->sbc;
       if (draw->stamp) ++(*draw->stamp);
+      /* EGL_BUFFER_PRESERVED requires the next render image to retain this
+       * frame. Reuse the ordinary loader's copy-back path before advancing
+       * the ring; source/consumer fences still govern buffer ownership. */
+      if (preserve_back)
+         draw->cur_blit_source = LOADER_DRI3_BACK_ID(draw->cur_back);
       draw->cur_back=(draw->cur_back+1)%draw->max_num_back;
       mtx_unlock(&draw->mtx);
    }
