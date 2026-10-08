@@ -116,6 +116,13 @@ static struct hdmi_pipe_generation *admit(struct hdmi_pipe *p,unsigned w,unsigne
  struct dri_image image={.width=w,.height=h};struct loader_dri3_buffer b={.image=&image,.width=w,.height=h,.cpp=4};
  mtx_lock(&p->admission_lock);mtx_lock(&p->lock);struct hdmi_pipe_generation *g=hdmi_pipe_generation(p,&b);mtx_unlock(&p->lock);mtx_unlock(&p->admission_lock);return g;
 }
+static struct hdmi_pipe_slot *get_slot(struct hdmi_pipe *p,struct hdmi_pipe_generation *g) {
+ mtx_lock(&p->admission_lock);mtx_lock(&p->lock);struct hdmi_pipe_slot *slot=hdmi_pipe_get_slot(p,g);mtx_unlock(&p->lock);mtx_unlock(&p->admission_lock);return slot;
+}
+static void fill(struct hdmi_pipe *p,struct hdmi_pipe_generation *g) {
+ for(unsigned i=0;i<3;i++){struct hdmi_pipe_slot *s=get_slot(p,g);assert(s&&s->image);s->phase=HDMI_PRESENTED;}
+}
+static void release(struct hdmi_pipe_generation *g) {for(unsigned i=0;i<3;i++)g->slots[i].phase=HDMI_FREE;}
 struct admission {struct hdmi_pipe *p;struct hdmi_pipe_generation *result;int done;};
 static int async_admit(void *data) {struct admission *a=data;a->result=admit(a->p,40,30);p_atomic_set(&a->done,1);return 0;}
 static void wait_test(bool stop) {
@@ -125,6 +132,23 @@ static void wait_test(bool stop) {
  struct timespec delay={.tv_nsec=20000000};thrd_sleep(&delay,NULL);assert(!p_atomic_read(&a.done));
  mtx_lock(&p.lock);if(stop)p_atomic_set(&p.stop,1);else p.generations[0].slots[0].phase=HDMI_FREE;cnd_broadcast(&p.changed);mtx_unlock(&p.lock);
  thrd_join(thread,NULL);assert(stop?!a.result:!!a.result);fini(&p);
+}
+struct slot_admission {struct hdmi_pipe *p;struct hdmi_pipe_generation *g;struct hdmi_pipe_slot *result;int done;};
+static int async_slot(void *data) {struct slot_admission *a=data;a->result=get_slot(a->p,a->g);p_atomic_set(&a->done,1);return 0;}
+static void slot_wait_test(bool stop,bool budget) {
+ struct hdmi_pipe p;struct loader_dri3_drawable d={0};init(&p,&d);p.lazy_slots=true;
+ struct hdmi_pipe_generation *g,*victim=NULL;
+ if(budget) {
+  padded_bytes=60ULL*1024*1024;
+  victim=admit(&p,10,10);fill(&p,victim);
+  struct hdmi_pipe_generation *other=admit(&p,20,10);fill(&p,other);
+  g=admit(&p,30,10);get_slot(&p,g)->phase=HDMI_PRESENTED;get_slot(&p,g)->phase=HDMI_PRESENTED;
+ } else {g=admit(&p,640,480);fill(&p,g);}
+ struct slot_admission a={.p=&p,.g=g};thrd_t thread;assert(thrd_create(&thread,async_slot,&a)==thrd_success);
+ struct timespec delay={.tv_nsec=20000000};thrd_sleep(&delay,NULL);assert(!p_atomic_read(&a.done));
+ mtx_lock(&p.lock);if(stop)p_atomic_set(&p.stop,1);else if(budget)release(victim);else g->slots[0].phase=HDMI_FREE;cnd_broadcast(&p.changed);mtx_unlock(&p.lock);
+ thrd_join(thread,NULL);assert(stop?!a.result:!!a.result);if(budget&&!stop)assert(p.cache_evictions==1);
+ fini(&p);padded_bytes=0;
 }
 int main(void) {
  struct hdmi_pipe p;struct loader_dri3_drawable d={0};init(&p,&d);
@@ -172,5 +196,42 @@ int main(void) {
  assert(admit(&p,641,479));fini(&p);
  assert(!readbacks);readback_control=true;init(&p,&d);
  assert(admit(&p,641,479));assert(readbacks==HDMI_PIPE_SLOTS);fini(&p);readback_control=false;
- assert(created==destroyed);puts("PASS: production cache reuse, bounded padded allocations, busy pinning, event-lock freedom, retirement, failure cleanup, wait and stop; logical resize capacity, exact fullscreen and region lifetime");
+ /* Demand storage starts with one initialized image, grows only while old
+  * images remain owned, and reuses a free initialized image before allocating. */
+ init(&p,&d);p.lazy_slots=true;p.resize_capacity=true;
+ struct hdmi_pipe_generation *lazy=admit(&p,641,479);assert(lazy&&live_images==1&&live_pixmaps==1&&live_regions==1);
+ struct hdmi_pipe_slot *first=get_slot(&p,lazy);assert(first==&lazy->slots[0]);
+ for(unsigned i=0;i<10;i++)assert(get_slot(&p,lazy)==first);
+ first->phase=HDMI_PRESENTED;first->completed=true;first->idle=false;
+ struct hdmi_pipe_slot *replacement=get_slot(&p,lazy);assert(replacement&&replacement!=first&&live_images==2);
+ replacement->phase=HDMI_PRESENTED;
+ struct hdmi_pipe_slot *third=get_slot(&p,lazy);assert(third&&third!=first&&third!=replacement&&live_images==3);
+ third->phase=HDMI_PRESENTED;first->phase=HDMI_FREE;
+ assert(get_slot(&p,lazy)==first&&p.shared_images==3&&p.cache_evictions==0);fini(&p);
+ /* Failed growth cleans only the uncommitted image, preserving the active
+  * scanout and its immutable descriptors. */
+ init(&p,&d);p.lazy_slots=true;p.resize_capacity=true;lazy=admit(&p,641,479);first=get_slot(&p,lazy);first->phase=HDMI_PRESENTED;
+ uint64_t held_bytes=lazy->bytes;unsigned held_pixmap=first->pixmap;
+ fail_create=1;assert(!get_slot(&p,lazy));assert(lazy->bytes==held_bytes&&first->pixmap==held_pixmap&&live_images==1);
+ fail_import=1;assert(!get_slot(&p,lazy));assert(live_images==1&&live_pixmaps==1&&live_regions==1);
+ fail_region=1;assert(!get_slot(&p,lazy));assert(live_images==1&&live_pixmaps==1&&live_regions==1);
+ assert(get_slot(&p,lazy));assert(live_images==2);fini(&p);
+ /* Incremental growth charges actual padding, evicts an idle other cache
+  * generation, and cannot evict its pinned target. */
+ init(&p,&d);p.lazy_slots=true;padded_bytes=60ULL*1024*1024;
+ struct hdmi_pipe_generation *lg0=admit(&p,10,10),*lg1=admit(&p,20,10),*lg2=admit(&p,30,10);
+ assert(p.generation==3&&live_images==3&&p.cache_evictions==0);
+ fill(&p,lg0);release(lg0);fill(&p,lg1);release(lg1);
+ first=get_slot(&p,lg2);first->phase=HDMI_PRESENTED;replacement=get_slot(&p,lg2);replacement->phase=HDMI_PRESENTED;
+ identity=lg2->identity;assert(get_slot(&p,lg2));assert(lg2->identity==identity&&p.cache_evictions==1);
+ uint64_t used=0;for(unsigned i=0;i<3;i++)used+=p.generations[i].bytes;assert(used<=HDMI_PIPE_BYTES);
+ fini(&p);
+ /* A padded first image must leave room for the full replacement chain. */
+ init(&p,&d);p.lazy_slots=true;padded_bytes=180ULL*1024*1024;assert(!admit(&p,10,10));assert(!live_images&&!live_pixmaps);
+ padded_bytes=0;fini(&p);
+ slot_wait_test(false,false);slot_wait_test(true,false);slot_wait_test(false,true);slot_wait_test(true,true);
+ /* Storage exhaustion with no idle victim is a condition wait, including
+  * stop escape, never reuse of protected data. */
+ init(&p,&d);p.lazy_slots=true;lazy=admit(&p,640,480);fill(&p,lazy);p_atomic_set(&p.stop,1);assert(!get_slot(&p,lazy));fini(&p);
+ assert(created==destroyed);puts("PASS: production cache reuse, bounded padded allocations, busy pinning, event-lock freedom, retirement, failure cleanup, wait and stop; logical resize capacity, exact fullscreen and region lifetime; demand-slot growth, initialized reuse, protected replacement, padded expansion budgets and failure cleanup");
 }

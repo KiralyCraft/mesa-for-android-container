@@ -44,13 +44,13 @@ struct hdmi_pipe {
    thrd_t worker, retire_worker;
    int wake_fd, stop;
    int failed;
-   bool primed, threads_started, low_latency, resize_capacity, binding_diagnostic;
+   bool primed, threads_started, low_latency, resize_capacity, lazy_slots, binding_diagnostic;
    bool logged_binding;
    uint64_t binding_checks, binding_mismatches;
    unsigned paced_queue, paced_lead;
    uint64_t msc, target_msc, generation, submitted, copied, resolved, completed, accepted, next_order;
    uint64_t producer_us, submit_us, gpu_us, mutex_us;
-   uint64_t cache_clock, cache_hits, cache_evictions, capacity_reuses;
+   uint64_t cache_clock, cache_hits, cache_evictions, capacity_reuses, shared_images;
    /* Mutated under lock; log2-microsecond histograms are emitted at teardown. */
    struct { uint64_t count, total_us, max_us, buckets[32]; } timing[8];
    struct hdmi_pipe_generation generations[HDMI_PIPE_GENERATIONS];
@@ -169,10 +169,11 @@ hdmi_pipe_destroy_generation(struct hdmi_pipe *p, struct hdmi_pipe_generation *g
  * which the event worker alone reads after initialization. */
 static bool
 hdmi_pipe_allocate_generation(struct hdmi_pipe *p, struct hdmi_pipe_generation *g,
-                               uint64_t budget, uint64_t *required)
+                               unsigned count, uint64_t budget, uint64_t *required)
 {
    *required = 0;
-   for (unsigned i = 0; i < HDMI_PIPE_SLOTS; i++) {
+   assert(count && count <= HDMI_PIPE_SLOTS);
+   for (unsigned i = 0; i < count; i++) {
       struct hdmi_pipe_slot *s = &g->slots[i];
       int width = 0, height = 0;
       s->fence_fd = -1;
@@ -220,6 +221,25 @@ hdmi_pipe_allocate_generation(struct hdmi_pipe *p, struct hdmi_pipe_generation *
    return true;
 }
 
+/* Enter and return holding the event lock. Admission exclusively hands the
+ * allocation connection to retirement until destruction finishes, so retired
+ * backing remains inside the budget and never blocks Present event handling. */
+static bool
+hdmi_pipe_evict_generation(struct hdmi_pipe *p, unsigned victim)
+{
+   struct hdmi_pipe_generation *retired = malloc(sizeof(*retired));
+   if (!retired) return false;
+   assert(!p->retire_generation);
+   *retired = p->generations[victim];
+   memset(&p->generations[victim], 0, sizeof(p->generations[victim]));
+   p->retire_generation = retired; p->cache_evictions++;
+   cnd_broadcast(&p->changed);
+   int64_t start = os_time_get();
+   while (p->retire_generation) cnd_wait(&p->changed, &p->lock);
+   hdmi_pipe_time(p, HDMI_GENERATION_WAIT, os_time_get() - start);
+   return true;
+}
+
 /* Enter/leave with p->lock held. admission_lock serializes cache publication
  * and pins the chosen generation until its first slot has been reserved.
  * Neither X replies, imports nor resource destruction hold the event lock. */
@@ -241,8 +261,11 @@ hdmi_pipe_generation(struct hdmi_pipe *p, struct loader_dri3_buffer *buffer)
       width = MIN2(ALIGN_POT(width, HDMI_PIPE_CAPACITY_ALIGN), UINT16_MAX);
       height = MIN2(ALIGN_POT(height, HDMI_PIPE_CAPACITY_ALIGN), UINT16_MAX);
    }
-   uint64_t minimum = (uint64_t)width * height * 4 * HDMI_PIPE_SLOTS;
-   if (minimum > HDMI_PIPE_BYTES) return NULL;
+   unsigned initial_count = p->lazy_slots ? 1 : HDMI_PIPE_SLOTS;
+   /* Retain the maximum-swapchain size limit even for demand allocation: a
+    * fullscreen scanout must always have room for its protected replacement. */
+   if ((uint64_t)width * height * 4 * HDMI_PIPE_SLOTS > HDMI_PIPE_BYTES) return NULL;
+   uint64_t minimum = (uint64_t)width * height * 4 * initial_count;
    for (;;) {
       if (p_atomic_read(&p->stop) || p_atomic_read(&p->failed)) return NULL;
       unsigned vacant = HDMI_PIPE_GENERATIONS, victim = HDMI_PIPE_GENERATIONS;
@@ -268,7 +291,12 @@ hdmi_pipe_generation(struct hdmi_pipe *p, struct loader_dri3_buffer *buffer)
          uint64_t required;
          mtx_unlock(&p->lock);
          int64_t start = os_time_get();
-         bool ok = hdmi_pipe_allocate_generation(p, &created, HDMI_PIPE_BYTES - bytes, &required);
+         bool ok = hdmi_pipe_allocate_generation(p, &created, initial_count, HDMI_PIPE_BYTES - bytes, &required);
+         if (ok && p->lazy_slots && created.bytes > HDMI_PIPE_BYTES / HDMI_PIPE_SLOTS) {
+            /* Padding must not make replacement impossible after the first
+             * image becomes active scanout. Reject before publishing it. */
+            ok = false; required = created.bytes * HDMI_PIPE_SLOTS;
+         }
          if (!ok) hdmi_pipe_destroy_generation(p, &created);
          mtx_lock(&p->lock);
          hdmi_pipe_time(p, HDMI_ALLOCATE, os_time_get() - start);
@@ -278,7 +306,7 @@ hdmi_pipe_generation(struct hdmi_pipe *p, struct loader_dri3_buffer *buffer)
             continue;
          }
          struct hdmi_pipe_generation *g = &p->generations[vacant];
-         *g = created; g->identity = ++p->generation;
+         *g = created; g->identity = ++p->generation; p->shared_images += initial_count;
          g->last_used = ++p->cache_clock;
          for (unsigned i = 0; i < HDMI_PIPE_GENERATIONS; i++) p->generations[i].active = false;
          g->active = true;
@@ -287,24 +315,78 @@ hdmi_pipe_generation(struct hdmi_pipe *p, struct loader_dri3_buffer *buffer)
          return g;
       }
       if (victim != HDMI_PIPE_GENERATIONS) {
-         struct hdmi_pipe_generation *retired = malloc(sizeof(*retired));
-         if (!retired) return NULL;
-         assert(!p->retire_generation);
-         *retired = p->generations[victim];
-         memset(&p->generations[victim], 0, sizeof(p->generations[victim]));
-         p->retire_generation = retired; p->cache_evictions++;
-         cnd_broadcast(&p->changed);
-         int64_t start = os_time_get();
-         /* Keep retired storage inside the three-generation/byte budget until
-          * destruction completes. The event worker runs throughout this wait. */
-         while (p->retire_generation) cnd_wait(&p->changed, &p->lock);
-         hdmi_pipe_time(p, HDMI_GENERATION_WAIT, os_time_get() - start);
+         if (!hdmi_pipe_evict_generation(p, victim)) return NULL;
          continue;
       }
       int64_t start = os_time_get();
       cnd_wait(&p->changed, &p->lock);
       hdmi_pipe_time(p, HDMI_GENERATION_WAIT, os_time_get() - start);
    }
+}
+
+/* admission_lock pins g, while the event worker keeps retiring transfers.
+ * Prefer an already initialized free image; add storage only when all existing
+ * images are still owned. No unfinished source or scanout can become reusable.
+ */
+static struct hdmi_pipe_slot *
+hdmi_pipe_get_slot(struct hdmi_pipe *p, struct hdmi_pipe_generation *g)
+{
+   uint64_t minimum = 0;
+   while (!p_atomic_read(&p->failed) && !p_atomic_read(&p->stop)) {
+      struct hdmi_pipe_slot *empty = NULL;
+      unsigned initialized = 0;
+      for (unsigned i = 0; i < HDMI_PIPE_SLOTS; i++) {
+         struct hdmi_pipe_slot *slot = &g->slots[i];
+         if (slot->image) initialized++;
+         if (slot->phase != HDMI_FREE) continue;
+         if (slot->image) return slot;
+         if (!empty) empty = slot;
+      }
+      if (p->lazy_slots && empty) {
+         uint64_t bytes = 0;
+         unsigned victim = HDMI_PIPE_GENERATIONS;
+         if (!minimum) minimum = initialized ? g->bytes / initialized :
+            (uint64_t)g->width * g->height * 4;
+         if (minimum > HDMI_PIPE_BYTES - g->bytes) return NULL;
+         for (unsigned i = 0; i < HDMI_PIPE_GENERATIONS; i++) {
+            struct hdmi_pipe_generation *other = &p->generations[i];
+            bytes += other->bytes;
+            if (other != g && other->identity && hdmi_pipe_generation_idle(other) &&
+                (victim == HDMI_PIPE_GENERATIONS || other->last_used < p->generations[victim].last_used))
+               victim = i;
+         }
+         if (minimum <= HDMI_PIPE_BYTES - bytes) {
+            struct hdmi_pipe_generation created = {
+               .width=g->width, .height=g->height, .fourcc=g->fourcc,
+            };
+            uint64_t required;
+            mtx_unlock(&p->lock);
+            int64_t start = os_time_get();
+            bool ok = hdmi_pipe_allocate_generation(p, &created, 1, HDMI_PIPE_BYTES - bytes, &required);
+            if (!ok) hdmi_pipe_destroy_generation(p, &created);
+            mtx_lock(&p->lock);
+            hdmi_pipe_time(p, HDMI_ALLOCATE, os_time_get() - start);
+            if (!ok) {
+               if (!required || required > HDMI_PIPE_BYTES - g->bytes) return NULL;
+               minimum = MAX2(minimum, required);
+               continue;
+            }
+            /* Publication is atomic to the event worker. Actual padded
+             * allocation size, not the estimate, is charged to the cache. */
+            *empty = created.slots[0];
+            g->bytes += created.bytes; p->shared_images++;
+            return empty;
+         }
+         if (victim != HDMI_PIPE_GENERATIONS) {
+            if (!hdmi_pipe_evict_generation(p, victim)) return NULL;
+            continue;
+         }
+      }
+      int64_t waited = os_time_get();
+      cnd_wait(&p->changed, &p->lock);
+      hdmi_pipe_time(p, HDMI_SLOT_WAIT, os_time_get() - waited);
+   }
+   return NULL;
 }
 
 static void
@@ -587,6 +669,7 @@ hdmi_pipe_init(struct loader_dri3_drawable *draw)
    }
    p->paced_queue = paced_queue; p->paced_lead = paced_lead;
    p->resize_capacity = debug_get_bool_option("MESA_KGSL_HDMI_RESIZE_CAPACITY", true);
+   p->lazy_slots = debug_get_bool_option("MESA_KGSL_HDMI_LAZY_SLOTS", true);
    p->binding_diagnostic = debug_get_bool_option("MESA_KGSL_HDMI_BINDING_DIAGNOSTIC", false);
    p->draw = draw; p->next_order=1;
    p->wake_fd = eventfd(0,EFD_CLOEXEC|EFD_NONBLOCK);
@@ -640,6 +723,7 @@ hdmi_pipe_init(struct loader_dri3_drawable *draw)
    mesa_logi("DRI3: HDMI_LOS_MESA_RESIZE_ABI=1 bounded size cache; separate allocation connection");
    mesa_logi("DRI3: HDMI_LOS_MESA_CAPACITY_ABI=1 shared resize capacity=%u; logical valid/update regions",
              p->resize_capacity ? HDMI_PIPE_CAPACITY_ALIGN : 0);
+   mesa_logi("DRI3: HDMI_LOS_MESA_SLOT_ABI=1 lazy_shared_slots=%u", p->lazy_slots);
    mesa_logi("DRI3: HDMI_LOS_MESA_QUEUE_ABI=1 queue=%s", p->low_latency ? "low-latency" : "fifo");
    mesa_logi("DRI3: HDMI_LOS_MESA_PACED_QUEUE_ABI=1 max_pending=%u re_prime_lead=%u",
              p->paced_queue, p->paced_lead);
@@ -709,14 +793,7 @@ hdmi_pipe_present(struct loader_dri3_drawable *draw, struct loader_dri3_buffer *
       hdmi_pipe_time(p, HDMI_SLOT_WAIT, os_time_get() - waited);
    }
    struct hdmi_pipe_generation *g = hdmi_pipe_generation(p,buffer);
-   struct hdmi_pipe_slot *s = NULL;
-   while (g && !p_atomic_read(&p->failed) && !p_atomic_read(&p->stop)) {
-      for (unsigned i=0;i<HDMI_PIPE_SLOTS;i++) if (g->slots[i].phase == HDMI_FREE) { s=&g->slots[i]; break; }
-      if (s) break;
-      int64_t waited = os_time_get();
-      cnd_wait(&p->changed,&p->lock);
-      hdmi_pipe_time(p, HDMI_SLOT_WAIT, os_time_get() - waited);
-   }
+   struct hdmi_pipe_slot *s = g ? hdmi_pipe_get_slot(p, g) : NULL;
    if (!s) { mtx_unlock(&p->lock); mtx_unlock(&p->admission_lock); if (producer_fd >= 0) close(producer_fd); return false; }
    s->source=buffer; s->interval=draw->swap_interval; s->integrated=draw->hdmi_pipeline_resolve;
    s->width=buffer->width; s->height=buffer->height;
@@ -816,6 +893,7 @@ hdmi_pipe_fini(struct loader_dri3_drawable *draw)
    mesa_logi("DRI3: HDMI resize generations=%" PRIu64 " cache_hits=%" PRIu64 " evictions=%" PRIu64,
              p->generation, p->cache_hits, p->cache_evictions);
    mesa_logi("DRI3: HDMI capacity reuses=%" PRIu64, p->capacity_reuses);
+   mesa_logi("DRI3: HDMI shared images allocated=%" PRIu64 " lazy=%u", p->shared_images, p->lazy_slots);
    static const char *names[] = {"admission_lock", "generation_wait", "allocate_import",
       "generation_retire", "slot_wait", "resolve_submit", "fence_export", "drawable_prepare"};
    for (unsigned i=0; i<ARRAY_SIZE(names); i++) {
