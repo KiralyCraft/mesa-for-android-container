@@ -2588,10 +2588,11 @@ loader_dri3_swap_buffers_msc(struct loader_dri3_drawable *draw,
    }
 
    bool bridge_presented = false;
+   uint64_t hdmi_paced_order = 0;
    if (draw->hdmi_pipeline_enabled) {
       bridge_presented=hdmi_pipe_present(draw,back,render_fence_fd,flush_flags,
                                        target_msc == 0 && divisor == 0 && remainder == 0 && !force_copy,
-                                       force_copy);
+                                       force_copy, &hdmi_paced_order);
       render_fence_fd=-1;
       if (!bridge_presented) {
          struct hdmi_pipe *p = draw->hdmi_pipeline;
@@ -2615,6 +2616,12 @@ loader_dri3_swap_buffers_msc(struct loader_dri3_drawable *draw,
    if (bridge_presented) {
       if (draw->hdmi_pipeline_enabled) {
          dri_invalidate_drawable(draw->dri_drawable);
+         if (hdmi_paced_order) {
+            if (draw->cur_num_back == draw->max_num_back &&
+                !draw->queries_buffer_age && draw->block_on_depleted_buffers)
+               dri3_find_back(draw, draw->prefer_back_buffer_reuse);
+            hdmi_pipe_pace(draw, hdmi_paced_order);
+         }
          return (int64_t)draw->send_sbc;
       }
       mtx_lock(&draw->mtx);

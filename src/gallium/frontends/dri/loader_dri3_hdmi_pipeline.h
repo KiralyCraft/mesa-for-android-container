@@ -4,6 +4,7 @@
  * as an X11 shared-memory fence; Present is sent only after successful readiness.
  */
 #include <sys/stat.h>
+#include "loader_dri3_pacer.h"
 
 #define HDMI_PIPE_GENERATIONS 3
 #define HDMI_PIPE_SLOTS 3
@@ -24,7 +25,7 @@ struct hdmi_pipe_slot {
    uint32_t serial;
    unsigned width, height;
    uint64_t order, sbc;
-   bool completed, idle, integrated, low_latency, paced_latency;
+   bool completed, idle, integrated, low_latency, paced_latency, paced_zero;
    int64_t started_ns;
 };
 struct hdmi_pipe_generation {
@@ -48,6 +49,12 @@ struct hdmi_pipe {
    bool logged_binding;
    uint64_t binding_checks, binding_mismatches;
    unsigned paced_queue, paced_lead;
+   /* HDMI owns its clock and ledger. Never enable the Lorie capability path
+    * or change the Termux:X11 pacer embedded in the drawable. */
+   struct loader_dri3_pacer pacer;
+   bool paced_zero_active, pacing_stats;
+   unsigned paced_width, paced_height;
+   uint64_t paced_submitted_order, paced_submitted_target;
    uint64_t msc, target_msc, generation, submitted, copied, resolved, completed, accepted, next_order;
    uint64_t producer_us, submit_us, gpu_us, mutex_us;
    uint64_t cache_clock, cache_hits, cache_evictions, capacity_reuses, shared_images;
@@ -393,7 +400,7 @@ static void
 hdmi_pipe_complete_msc(struct hdmi_pipe *p, const struct hdmi_pipe_slot *s, uint64_t msc)
 {
    if (!p->primed || p->target_msc <= msc)
-      p->target_msc = msc + (s->paced_latency ? p->paced_lead : 2);
+      p->target_msc = msc + (s->paced_zero ? 1 : s->paced_latency ? p->paced_lead : 2);
    p->primed = true;
 }
 
@@ -415,12 +422,20 @@ hdmi_pipe_events(struct hdmi_pipe *p)
                   if (!s->completed) {
                      s->completed = true; p->completed++; p->msc = ce->msc;
                      completed_sbc=s->sbc; completed_msc=ce->msc; completed_ust=ce->ust;
+                     if (s->paced_zero)
+                        loader_dri3_pacer_note_complete(&p->pacer, s->order,
+                                                       ce->ust, ce->msc, os_time_get());
                   }
                   hdmi_pipe_complete_msc(p, s, ce->msc);
                }
             } else if (ge->evtype == XCB_PRESENT_EVENT_IDLE_NOTIFY) {
                xcb_present_idle_notify_event_t *ie = (void *)ge;
-               if (ie->pixmap == s->pixmap && ie->serial == s->serial) s->idle = true;
+               if (ie->pixmap == s->pixmap && ie->serial == s->serial && !s->idle) {
+                  s->idle = true;
+                  if (s->paced_zero)
+                     loader_dri3_pacer_note_storage_released(&p->pacer, s->order,
+                                                             os_time_get());
+               }
             }
             if (s->completed && s->idle) s->phase = HDMI_FREE;
          }
@@ -524,16 +539,36 @@ hdmi_pipe_pending(const struct hdmi_pipe *p)
 }
 
 static bool
-hdmi_pipe_can_submit(const struct hdmi_pipe *p, const struct hdmi_pipe_slot *next)
+hdmi_pipe_paced_zero(bool ordinary, int interval, bool requested)
 {
-   if (!next->low_latency)
-      return !(p->submitted && !p->primed && next->interval > 0);
-   /* A target-zero request must not overtake a previously scheduled request
-    * when an application changes interval or mixes swap APIs. */
+   return ordinary && interval == 0 && requested;
+}
+
+static bool
+hdmi_pipe_pending_before(const struct hdmi_pipe *p, uint64_t order)
+{
    for (unsigned g = 0; g < HDMI_PIPE_GENERATIONS; g++)
       for (unsigned i = 0; i < HDMI_PIPE_SLOTS; i++) {
          const struct hdmi_pipe_slot *s = &p->generations[g].slots[i];
-         if (s->phase == HDMI_PRESENTED && !s->low_latency && !s->completed)
+         if (s->order < order && s->phase != HDMI_FREE &&
+             !(s->phase == HDMI_PRESENTED && s->completed))
+            return true;
+      }
+   return false;
+}
+
+static bool
+hdmi_pipe_can_submit(const struct hdmi_pipe *p, const struct hdmi_pipe_slot *next)
+{
+   if (!next->low_latency && !next->paced_zero)
+      return !(p->submitted && !p->primed && next->interval > 0);
+   /* Paced work has one commitment; target-zero unpaced work cannot overtake
+    * a scheduled request when the application changes interval or swap API. */
+   for (unsigned g = 0; g < HDMI_PIPE_GENERATIONS; g++)
+      for (unsigned i = 0; i < HDMI_PIPE_SLOTS; i++) {
+         const struct hdmi_pipe_slot *s = &p->generations[g].slots[i];
+         if (s->phase == HDMI_PRESENTED && !s->completed &&
+             (next->paced_zero || !s->low_latency))
             return false;
       }
    return true;
@@ -608,6 +643,8 @@ hdmi_pipe_thread(void *data)
             }
             hdmi_pipe_release_source(p,s);
             s->phase=HDMI_READY;
+            if (s->paced_zero)
+               loader_dri3_pacer_note_producer_ready(&p->pacer, s->order, os_time_get());
          }
       }
       /* Preserve accepted-frame FIFO across slots and resize generations.
@@ -619,9 +656,15 @@ hdmi_pipe_thread(void *data)
             if (s->phase != HDMI_FREE && s->phase != HDMI_PRESENTED && s->order==p->next_order) next=s;
          }
          if (!next || next->phase != HDMI_READY) break;
-         if (p_atomic_read(&p->failed) || p_atomic_read(&p->stop)) { next->phase=HDMI_FREE; p->next_order++; continue; }
+         if (p_atomic_read(&p->failed) || p_atomic_read(&p->stop)) {
+            if (next->paced_zero) loader_dri3_pacer_cancel(&p->pacer, next->order, os_time_get());
+            next->phase=HDMI_FREE; p->next_order++; continue;
+         }
          if (!hdmi_pipe_can_submit(p, next)) break;
          uint64_t target=next->low_latency ? 0 : (p->primed ? p->target_msc : 0);
+         /* One committed paced frame, plus one producer. Re-prime from real
+          * completion accounting rather than inheriting an old queue lead. */
+         if (next->paced_zero) target=p->msc ? p->msc+1 : 0;
          if (!next->low_latency && p->primed) p->target_msc += MAX2(abs(next->interval),1);
          next->serial=++p->serial; next->completed=next->idle=false;
          next->phase=HDMI_PRESENTED; p->submitted++; p->next_order++;
@@ -635,6 +678,13 @@ hdmi_pipe_thread(void *data)
          }
          xcb_present_pixmap(p->conn,p->draw->drawable,next->pixmap,next->serial,next->valid,next->valid,0,0,XCB_NONE,XCB_NONE,XCB_NONE,options,target,0,0,0,NULL);
          xcb_flush(p->conn);
+         if (next->paced_zero) {
+            uint64_t now=os_time_get();
+            loader_dri3_pacer_set_target(&p->pacer, next->order, target);
+            loader_dri3_pacer_note_submitted(&p->pacer, next->order, now);
+            p->paced_submitted_order=next->order;
+            p->paced_submitted_target=target;
+         }
       }
       cnd_broadcast(&p->changed);
       bool done=p_atomic_read(&p->stop) && !transfers;
@@ -668,6 +718,13 @@ hdmi_pipe_init(struct loader_dri3_drawable *draw)
       mesa_loge("DRI3: invalid HDMI paced queue/lead"); free(p); return false;
    }
    p->paced_queue = paced_queue; p->paced_lead = paced_lead;
+   int margin = debug_get_num_option("MESA_KGSL_HDMI_PACED_MARGIN_US", 8000);
+   if (margin < 0 || margin > 50000) {
+      mesa_loge("DRI3: invalid HDMI pacing margin"); free(p); return false;
+   }
+   loader_dri3_pacer_init(&p->pacer, os_time_get());
+   p->pacer.margin_us=margin;
+   p->pacing_stats=debug_get_bool_option("MESA_KGSL_HDMI_PACER_STATS", false);
    p->resize_capacity = debug_get_bool_option("MESA_KGSL_HDMI_RESIZE_CAPACITY", true);
    p->lazy_slots = debug_get_bool_option("MESA_KGSL_HDMI_LAZY_SLOTS", true);
    p->binding_diagnostic = debug_get_bool_option("MESA_KGSL_HDMI_BINDING_DIAGNOSTIC", false);
@@ -728,6 +785,9 @@ hdmi_pipe_init(struct loader_dri3_drawable *draw)
    mesa_logi("DRI3: HDMI_LOS_MESA_QUEUE_ABI=1 queue=%s", p->low_latency ? "low-latency" : "fifo");
    mesa_logi("DRI3: HDMI_LOS_MESA_PACED_QUEUE_ABI=1 max_pending=%u re_prime_lead=%u",
              p->paced_queue, p->paced_lead);
+   mesa_logi("DRI3: HDMI_LOS_MESA_PACER_ABI=1 interval_zero=%s margin_us=%" PRIu64,
+             draw->present_mode == LOADER_DRI3_PRESENT_PACED ? "paced" : "unpaced",
+             p->pacer.margin_us);
    return true;
 fail:
    draw->hdmi_pipeline = NULL;
@@ -777,16 +837,25 @@ hdmi_pipe_resolve_before_flush(void *data)
 static bool
 hdmi_pipe_present(struct loader_dri3_drawable *draw, struct loader_dri3_buffer *buffer,
                   int producer_fd, unsigned flush_flags, bool ordinary_swap,
-                  bool preserve_back)
+                  bool preserve_back, uint64_t *paced_order)
 {
+   *paced_order=0;
    if (!hdmi_pipe_init(draw)) { if (producer_fd >= 0) close(producer_fd); return false; }
    struct hdmi_pipe *p = draw->hdmi_pipeline;
    int64_t lock_started = os_time_get();
    mtx_lock(&p->admission_lock);
    mtx_lock(&p->lock);
    hdmi_pipe_time(p, HDMI_LOCK, os_time_get() - lock_started);
-   bool low_latency = p->low_latency && ordinary_swap && draw->swap_interval == 0;
-   unsigned admission_budget = hdmi_pipe_admission_budget(p, ordinary_swap, draw->swap_interval);
+   bool paced_zero = hdmi_pipe_paced_zero(ordinary_swap, draw->swap_interval,
+                                        draw->present_mode == LOADER_DRI3_PRESENT_PACED);
+   if (paced_zero != p->paced_zero_active ||
+       (paced_zero && (p->paced_width != buffer->width || p->paced_height != buffer->height))) {
+      loader_dri3_pacer_reset_generation(&p->pacer, os_time_get());
+      p->paced_zero_active=paced_zero;
+      p->paced_width=buffer->width; p->paced_height=buffer->height;
+   }
+   bool low_latency = !paced_zero && p->low_latency && ordinary_swap && draw->swap_interval == 0;
+   unsigned admission_budget = paced_zero ? 2 : hdmi_pipe_admission_budget(p, ordinary_swap, draw->swap_interval);
    while (admission_budget &&
           (low_latency ? hdmi_pipe_outstanding(p) : hdmi_pipe_pending(p)) >= admission_budget &&
           !p_atomic_read(&p->failed) && !p_atomic_read(&p->stop)) {
@@ -797,13 +866,26 @@ hdmi_pipe_present(struct loader_dri3_drawable *draw, struct loader_dri3_buffer *
    struct hdmi_pipe_generation *g = hdmi_pipe_generation(p,buffer);
    struct hdmi_pipe_slot *s = g ? hdmi_pipe_get_slot(p, g) : NULL;
    if (!s) { mtx_unlock(&p->lock); mtx_unlock(&p->admission_lock); if (producer_fd >= 0) close(producer_fd); return false; }
-   s->source=buffer; s->interval=draw->swap_interval; s->integrated=draw->hdmi_pipeline_resolve;
+   if (paced_zero) {
+      while (!loader_dri3_pacer_reserve(&p->pacer, p->accepted+1, 0,
+                                       p->pacer.current_admission_us, os_time_get())) {
+         if (p_atomic_read(&p->failed) || p_atomic_read(&p->stop)) {
+            mtx_unlock(&p->lock); mtx_unlock(&p->admission_lock);
+            if (producer_fd >= 0) close(producer_fd);
+            return false;
+         }
+         cnd_wait(&p->changed, &p->lock);
+      }
+   }
+   s->source=buffer; s->interval=paced_zero ? 1 : draw->swap_interval; s->integrated=draw->hdmi_pipeline_resolve;
    s->width=buffer->width; s->height=buffer->height;
    s->low_latency=low_latency;
+   s->paced_zero=paced_zero;
    s->paced_latency=p->low_latency && ordinary_swap && draw->swap_interval == 1;
    p_atomic_inc(&buffer->pipeline_refs);
    /* Reserve before releasing the generation lock for application submission. */
    s->phase=HDMI_RESERVED; s->fence_fd=-1; s->order=++p->accepted; s->started_ns=os_time_get();
+   if (paced_zero) *paced_order=s->order;
    mtx_unlock(&p->lock);
    mtx_lock(&draw->mtx); buffer->busy=true; mtx_unlock(&draw->mtx);
    int fd=producer_fd;
@@ -870,6 +952,66 @@ hdmi_pipe_present(struct loader_dri3_drawable *draw, struct loader_dri3_buffer *
    return fd >= 0;
 }
 
+/* End-of-swap pacing is deliberately client-side. Xorg's main thread and the
+ * native-fence/event worker continue processing normally throughout the wait.
+ * Call after any writable-back-buffer wait so production time excludes storage
+ * retention, as it does in the original Termux:X11 pacing path. */
+static void
+hdmi_pipe_pace(struct loader_dri3_drawable *draw, uint64_t order)
+{
+   struct hdmi_pipe *p=draw->hdmi_pipeline;
+   uint64_t start=os_time_get(), deadline=0;
+   mtx_lock(&p->lock);
+   uint64_t timeout=start+MAX2(p->pacer.period_us*3, UINT64_C(120000));
+   /* Mirror the Termux policy's previous-commitment gate, not a synchronous
+    * wait for this frame's GPU readiness. The worker remains responsible for
+    * readiness, and production of the next frame may overlap this one. */
+   while (hdmi_pipe_pending_before(p, order) &&
+          !p_atomic_read(&p->failed) && !p_atomic_read(&p->stop)) {
+      uint64_t now=os_time_get();
+      if (now >= timeout) {
+         /* Drop timing prediction only; pending GPU/storage ownership stays
+          * pinned and FIFO/backpressure still applies to future swaps. */
+         loader_dri3_pacer_timing_timeout(&p->pacer, now);
+         break;
+      }
+      struct timespec abs;
+      timespec_get(&abs, TIME_UTC);
+      uint64_t ns=abs.tv_nsec+(timeout-now)*1000;
+      abs.tv_sec+=ns/1000000000; abs.tv_nsec=ns%1000000000;
+      cnd_timedwait(&p->changed, &p->lock, &abs);
+   }
+   if (!hdmi_pipe_pending_before(p, order)) {
+      uint64_t target=p->paced_submitted_order == order ?
+                      p->paced_submitted_target : p->msc ? p->msc+1 : 0;
+      deadline=loader_dri3_pacer_next_admission(&p->pacer, target, os_time_get());
+   }
+   uint64_t waited=os_time_get();
+   loader_dri3_pacer_note_block(&p->pacer, LOADER_DRI3_PACER_BLOCK_COMMITMENT,
+                               waited-start, waited);
+   mtx_unlock(&p->lock);
+   if (deadline > waited) os_time_nanosleep_until(deadline*1000);
+   uint64_t admitted=os_time_get();
+   mtx_lock(&p->lock);
+   if (deadline > waited)
+      loader_dri3_pacer_note_block(&p->pacer, LOADER_DRI3_PACER_BLOCK_ADMISSION,
+                                  admitted-waited, admitted);
+   loader_dri3_pacer_admit_next(&p->pacer, admitted);
+   if (p->pacing_stats && order % 300 == 0) {
+      struct loader_dri3_pacer_snapshot snapshot;
+      loader_dri3_pacer_snapshot(&p->pacer, admitted, &snapshot);
+      mesa_logi("DRI3: HDMI pacer frame=%" PRIu64 " period_us=%" PRIu64
+                " production_p95_us=%" PRIu64 " margin_us=%" PRIu64
+                " outstanding=%u retained=%u admission_waits=%" PRIu64
+                " late=%" PRIu64 " timed_out=%u",
+                order, snapshot.period_us, snapshot.production_p95_us, p->pacer.margin_us,
+                p->pacer.outstanding_frames, p->pacer.retained_allocations,
+                snapshot.stats.block_count[LOADER_DRI3_PACER_BLOCK_ADMISSION],
+                snapshot.stats.late_completions, p->pacer.timing_timed_out);
+   }
+   mtx_unlock(&p->lock);
+}
+
 static void
 hdmi_pipe_fini(struct loader_dri3_drawable *draw)
 {
@@ -903,6 +1045,15 @@ hdmi_pipe_fini(struct loader_dri3_drawable *draw)
              p->generation, p->cache_hits, p->cache_evictions);
    mesa_logi("DRI3: HDMI capacity reuses=%" PRIu64, p->capacity_reuses);
    mesa_logi("DRI3: HDMI shared images allocated=%" PRIu64 " lazy=%u", p->shared_images, p->lazy_slots);
+   struct loader_dri3_pacer_snapshot paced;
+   loader_dri3_pacer_snapshot(&p->pacer, os_time_get(), &paced);
+   mesa_logi("DRI3: HDMI interval-zero pacer submitted=%" PRIu64 " completed=%" PRIu64
+             " period_us=%" PRIu64 " production_p95_us=%" PRIu64 " margin_us=%" PRIu64
+             " admission_waits=%" PRIu64 " admission_us=%" PRIu64 " late=%" PRIu64 " ledger_overflows=%" PRIu64,
+             paced.stats.submitted, paced.stats.completed, paced.period_us, paced.production_p95_us,
+             p->pacer.margin_us, paced.stats.block_count[LOADER_DRI3_PACER_BLOCK_ADMISSION],
+             paced.stats.block_us[LOADER_DRI3_PACER_BLOCK_ADMISSION],
+             paced.stats.late_completions, paced.stats.ledger_overflows);
    static const char *names[] = {"admission_lock", "generation_wait", "allocate_import",
       "generation_retire", "slot_wait", "resolve_submit", "fence_export", "drawable_prepare"};
    for (unsigned i=0; i<ARRAY_SIZE(names); i++) {

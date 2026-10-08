@@ -151,6 +151,38 @@ static void slot_wait_test(bool stop,bool budget) {
  fini(&p);padded_bytes=0;
 }
 int main(void) {
+ /* Explicit HDMI opt-in only. Interval-one, OML scheduling, and ordinary
+  * unpaced interval-zero retain their existing policies. */
+ assert(hdmi_pipe_paced_zero(true,0,true));
+ assert(!hdmi_pipe_paced_zero(true,0,false));
+ assert(!hdmi_pipe_paced_zero(false,0,true));
+ assert(!hdmi_pipe_paced_zero(true,1,true));
+ assert(!hdmi_pipe_paced_zero(true,-1,true));
+ struct hdmi_pipe policy={0};
+ struct hdmi_pipe_slot candidate={.paced_zero=true,.interval=1};
+ struct hdmi_pipe_slot *committed=&policy.generations[0].slots[0];
+ committed->phase=HDMI_PRESENTED;committed->low_latency=true;
+ committed->order=4;
+ assert(hdmi_pipe_pending_before(&policy,5));
+ assert(!hdmi_pipe_pending_before(&policy,4));
+ assert(!hdmi_pipe_can_submit(&policy,&candidate));
+ committed->completed=true;
+ assert(!hdmi_pipe_pending_before(&policy,5));
+ assert(hdmi_pipe_can_submit(&policy,&candidate));
+ assert(hdmi_pipe_pending(&policy)==0&&hdmi_pipe_outstanding(&policy)==1);
+ hdmi_pipe_complete_msc(&policy,&candidate,100);
+ assert(policy.primed&&policy.target_msc==101);
+ policy.target_msc=105;hdmi_pipe_complete_msc(&policy,&candidate,101);
+ assert(policy.target_msc==105);
+ /* Pacing never releases consumer-owned storage or advances an unfinished
+  * older flip when an application changes its interval. */
+ candidate.paced_zero=false;candidate.low_latency=true;committed->completed=false;committed->low_latency=false;
+ assert(!hdmi_pipe_can_submit(&policy,&candidate));
+ committed->completed=true;assert(hdmi_pipe_can_submit(&policy,&candidate));
+ committed->phase=HDMI_PRODUCER;
+ assert(hdmi_pipe_pending_before(&policy,5));
+ committed->phase=HDMI_FREE;
+ assert(!hdmi_pipe_pending_before(&policy,5));
  struct hdmi_pipe p;struct loader_dri3_drawable d={0};init(&p,&d);
  uint64_t ids[3];for(unsigned i=0;i<3;i++)ids[i]=admit(&p,800+i,600)->identity;
  for(unsigned repeat=0;repeat<10;repeat++)for(unsigned i=0;i<3;i++)assert(admit(&p,800+i,600)->identity==ids[i]);
